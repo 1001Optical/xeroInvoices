@@ -2,6 +2,7 @@ import express from 'express';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import mysql from 'mysql2/promise';
+import pLimit from 'p-limit';
 import { BRANCHES, STOCK_TYPES, CLEARING_ACCOUNT_CODE, PAYMENT_TYPES } from './constants.js';
 
 // 환경 변수 로드
@@ -25,10 +26,10 @@ const db = mysql.createPool({
 });
 
 
-// # 모든 브랜치 처리 (날짜는 항상 2025-11-24)
+// # 모든 브랜치 처리 (날짜는 항상 당일)
 // node index.js
 
-// # 특정 브랜치만 처리 (날짜는 항상 2025-11-24)
+// # 특정 브랜치만 처리 (날짜는 항상 당일)
 // node index.js PA1
 
 
@@ -715,8 +716,9 @@ async function createManualJournal(manualJournalData) {
  * 특정 브랜치와 날짜에 대해 Manual Journal 생성
  * @param {string} branchCode - 브랜치 코드 (예: 'PA1')
  * @param {Date} date - 처리할 날짜
+ * @param {Function} limitFn - concurrency 제어 함수 (p-limit)
  */
-async function processBranchAndDate(branchCode, date) {
+async function processBranchAndDate(branchCode, date, limitFn) {
   const branchName = getBranchName(branchCode);
   const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD 형식
 
@@ -725,11 +727,12 @@ async function processBranchAndDate(branchCode, date) {
   const startDate = formatOptomateDate(date, 13); // 전날 13:00 UTC (현지 00:00)
   const endDate = formatOptomateDate(date, 12); // 당일 12:59:59 UTC (현지 23:59:59)
 
-  // Optomate에서 Invoice 데이터 가져오기
-  const invoices = await fetchOptomateInvoices(branchCode, startDate, endDate);
-
-  // Optomate에서 Receipt 데이터 가져오기
-  const receipts = await fetchOptomateReceipts(branchCode, startDate, endDate);
+  // Optomate에서 Invoice와 Receipt 데이터를 concurrency=2로 병렬 가져오기
+  // limitFn을 사용하여 동시 실행을 2개로 제한
+  const [invoices, receipts] = await Promise.all([
+    limitFn(() => fetchOptomateInvoices(branchCode, startDate, endDate)),
+    limitFn(() => fetchOptomateReceipts(branchCode, startDate, endDate))
+  ]);
 
   // Invoice에서 JournalLines 생성
   let journalLines = [];
@@ -797,8 +800,10 @@ async function main() {
       throw new Error('MySQL에 Refresh Token이 없습니다. 최초 설정을 진행하세요: npm run init');
     }
 
-    // 날짜 고정: 2025-11-24
-    const processDate = new Date('2025-11-24');
+    // 날짜를 항상 당일(오늘)로 설정
+    const processDate = new Date();
+    // 시간을 00:00:00으로 설정하여 당일 날짜만 사용
+    processDate.setHours(0, 0, 0, 0);
     
     // 명령줄 인자로 브랜치 코드만 받기
     let targetBranchCode = null;
@@ -807,6 +812,7 @@ async function main() {
     }
 
     const dateStr = processDate.toISOString().split('T')[0];
+    console.log(`📅 처리 날짜: ${dateStr} (당일)`);
     
     // 처리할 브랜치 결정
     let branchesToProcess = [];
@@ -822,11 +828,14 @@ async function main() {
       branchesToProcess = BRANCHES;
     }
 
-    // 브랜치 처리
+    // concurrency 제어: receipt/invoice 호출에 concurrency=2 적용
+    const apiLimit = pLimit(2);
+    
+    // 브랜치 처리 (각 브랜치별로 receipt/invoice는 내부에서 concurrency=2로 처리됨)
     const results = [];
     for (const branch of branchesToProcess) {
       try {
-        const result = await processBranchAndDate(branch.code, processDate);
+        const result = await processBranchAndDate(branch.code, processDate, apiLimit);
         if (result) {
           results.push({ branch: branch.code, success: true, result });
         }
