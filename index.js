@@ -716,15 +716,11 @@ async function createManualJournal(manualJournalData) {
  * 특정 브랜치와 날짜에 대해 Manual Journal 생성
  * @param {string} branchCode - 브랜치 코드 (예: 'PA1')
  * @param {Date} date - 처리할 날짜 (formatOptomateDate가 전날을 반환하므로 하루 더한 날짜)
+ * @param {string} dateStr - 실제 거래일 문자열 (YYYY-MM-DD 형식)
  * @param {Function} limitFn - concurrency 제어 함수 (p-limit)
  */
-async function processBranchAndDate(branchCode, date, limitFn) {
+async function processBranchAndDate(branchCode, date, dateStr, limitFn) {
   const branchName = getBranchName(branchCode);
-  
-  // formatOptomateDate가 전날을 반환하므로, 실제 거래일은 하루 전
-  const actualDate = new Date(date);
-  actualDate.setDate(actualDate.getDate() - 1);
-  const dateStr = actualDate.toISOString().split('T')[0]; // YYYY-MM-DD 형식
 
   // UTC 날짜 범위 설정 (현지 거래일 기준, +11:00 시간대)
   // formatOptomateDate(date, 13)은 date의 전날 13:00 UTC를 반환
@@ -807,12 +803,18 @@ async function main() {
     }
 
     // 날짜를 항상 당일(오늘)로 설정
-    // formatOptomateDate 함수가 전날 13:00 UTC를 반환하므로,
+    // 로컬 시간대의 오늘 날짜를 기준으로 처리
+    // 예: 27일 저녁에 실행하면 27일 데이터를 가져옴
+    const now = new Date();
+    // 로컬 시간대의 오늘 날짜 (년-월-일만 추출)
+    const localYear = now.getFullYear();
+    const localMonth = now.getMonth();
+    const localDate = now.getDate();
+    
+    // 로컬 시간대의 오늘 00:00:00으로 설정
+    const processDate = new Date(localYear, localMonth, localDate, 0, 0, 0, 0);
+    // formatOptomateDate가 전날 13:00 UTC를 반환하므로,
     // 오늘 데이터를 가져오려면 processDate를 하루 더해야 함
-    const processDate = new Date();
-    // 시간을 00:00:00으로 설정하여 당일 날짜만 사용
-    processDate.setHours(0, 0, 0, 0);
-    // formatOptomateDate가 전날을 기준으로 하므로, 하루 더해서 오늘 데이터를 가져옴
     processDate.setDate(processDate.getDate() + 1);
     
     // 명령줄 인자로 브랜치 코드만 받기
@@ -821,10 +823,9 @@ async function main() {
       targetBranchCode = process.argv[2].toUpperCase();
     }
 
-    // 실제 처리할 날짜는 하루 전 (formatOptomateDate가 하루 빼기 때문)
-    const actualDate = new Date(processDate);
-    actualDate.setDate(actualDate.getDate() - 1);
-    const dateStr = actualDate.toISOString().split('T')[0];
+    // 실제 처리할 날짜는 오늘 (로컬 시간대 기준)
+    // toISOString()은 UTC 기준이므로 로컬 날짜를 직접 문자열로 변환
+    const dateStr = `${localYear}-${String(localMonth + 1).padStart(2, '0')}-${String(localDate).padStart(2, '0')}`;
     console.log(`📅 처리 날짜: ${dateStr} (당일)`);
     
     // 처리할 브랜치 결정
@@ -848,7 +849,7 @@ async function main() {
     const results = [];
     for (const branch of branchesToProcess) {
       try {
-        const result = await processBranchAndDate(branch.code, processDate, apiLimit);
+        const result = await processBranchAndDate(branch.code, processDate, dateStr, apiLimit);
         if (result) {
           results.push({ branch: branch.code, success: true, result });
         }
