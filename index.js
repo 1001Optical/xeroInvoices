@@ -715,17 +715,23 @@ async function createManualJournal(manualJournalData) {
 /**
  * 특정 브랜치와 날짜에 대해 Manual Journal 생성
  * @param {string} branchCode - 브랜치 코드 (예: 'PA1')
- * @param {Date} date - 처리할 날짜
+ * @param {Date} date - 처리할 날짜 (formatOptomateDate가 전날을 반환하므로 하루 더한 날짜)
  * @param {Function} limitFn - concurrency 제어 함수 (p-limit)
  */
 async function processBranchAndDate(branchCode, date, limitFn) {
   const branchName = getBranchName(branchCode);
-  const dateStr = date.toISOString().split('T')[0]; // YYYY-MM-DD 형식
+  
+  // formatOptomateDate가 전날을 반환하므로, 실제 거래일은 하루 전
+  const actualDate = new Date(date);
+  actualDate.setDate(actualDate.getDate() - 1);
+  const dateStr = actualDate.toISOString().split('T')[0]; // YYYY-MM-DD 형식
 
   // UTC 날짜 범위 설정 (현지 거래일 기준, +11:00 시간대)
-  // 예: 2025-11-23 현지 거래일 = 2025-11-22T13:00:00Z ~ 2025-11-23T12:59:59Z (UTC)
-  const startDate = formatOptomateDate(date, 13); // 전날 13:00 UTC (현지 00:00)
-  const endDate = formatOptomateDate(date, 12); // 당일 12:59:59 UTC (현지 23:59:59)
+  // formatOptomateDate(date, 13)은 date의 전날 13:00 UTC를 반환
+  // date가 하루 더해진 상태이므로, 실제로는 오늘 13:00 UTC ~ 내일 12:59:59 UTC 범위를 조회
+  // 예: 오늘 2025-01-15 → date는 2025-01-16 → 2025-01-15T13:00:00Z ~ 2025-01-16T12:59:59Z (UTC)
+  const startDate = formatOptomateDate(date, 13); // 오늘 13:00 UTC (현지 00:00)
+  const endDate = formatOptomateDate(date, 12); // 내일 12:59:59 UTC (현지 23:59:59)
 
   // Optomate에서 Invoice와 Receipt 데이터를 concurrency=2로 병렬 가져오기
   // limitFn을 사용하여 동시 실행을 2개로 제한
@@ -801,9 +807,13 @@ async function main() {
     }
 
     // 날짜를 항상 당일(오늘)로 설정
+    // formatOptomateDate 함수가 전날 13:00 UTC를 반환하므로,
+    // 오늘 데이터를 가져오려면 processDate를 하루 더해야 함
     const processDate = new Date();
     // 시간을 00:00:00으로 설정하여 당일 날짜만 사용
     processDate.setHours(0, 0, 0, 0);
+    // formatOptomateDate가 전날을 기준으로 하므로, 하루 더해서 오늘 데이터를 가져옴
+    processDate.setDate(processDate.getDate() + 1);
     
     // 명령줄 인자로 브랜치 코드만 받기
     let targetBranchCode = null;
@@ -811,7 +821,10 @@ async function main() {
       targetBranchCode = process.argv[2].toUpperCase();
     }
 
-    const dateStr = processDate.toISOString().split('T')[0];
+    // 실제 처리할 날짜는 하루 전 (formatOptomateDate가 하루 빼기 때문)
+    const actualDate = new Date(processDate);
+    actualDate.setDate(actualDate.getDate() - 1);
+    const dateStr = actualDate.toISOString().split('T')[0];
     console.log(`📅 처리 날짜: ${dateStr} (당일)`);
     
     // 처리할 브랜치 결정
