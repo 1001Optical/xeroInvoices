@@ -33,7 +33,7 @@ export const STOCK_TYPES = [
 ];
 
 // POS Clearing Account Code
-export const CLEARING_ACCOUNT_CODE = "82240";
+export const CLEARING_ACCOUNT_CODE = "18011";
 
 export const PAYMENT_TYPES = [
   { code: "EFT", description: "EFTPOS - Cheque/Savings", accountCode: "18001" },

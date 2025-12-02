@@ -467,11 +467,11 @@ function buildReceiptJournalLines(receipts, branchName) {
       return;
     }
 
-    // Payment Type 라인 (음수 - Credit)
+    // Payment Type 라인 (양수 - Debit)
     if (Math.abs(netAmount) > 0.01) {
       journalLines.push({
         Description: paymentTypeInfo.description,
-        LineAmount: -Math.abs(netAmount), // 음수 (Credit)
+        LineAmount: Math.abs(netAmount), // 양수 (Debit)
         AccountCode: paymentTypeInfo.accountCode,
         TaxType: "NONE",
         Tracking: [
@@ -486,11 +486,11 @@ function buildReceiptJournalLines(receipts, branchName) {
     }
   });
 
-  // POS Clearing 라인: 모든 Payment Type 합계 (양수 - Debit)
+  // POS Clearing 라인: 모든 Payment Type 합계 (음수 - Credit)
   if (Math.abs(totalPaymentAmount) > 0.01) {
     journalLines.push({
       Description: "POS Clearing",
-      LineAmount: totalPaymentAmount, // 양수 (Debit)
+      LineAmount: -Math.abs(totalPaymentAmount), // 음수 (Credit)
       AccountCode: CLEARING_ACCOUNT_CODE,
       TaxType: "NONE",
       Tracking: [
@@ -536,7 +536,7 @@ function buildJournalLines(stockTypeAmounts, branchName) {
     if (Math.abs(gstOnIncome) > 0.01) {
       journalLines.push({
         Description: stockTypeInfo.description,
-        LineAmount: -Math.abs(gstOnIncome), // 음수 (Income)
+        LineAmount: Math.abs(gstOnIncome), // 양수 (Debit)
         AccountCode: stockTypeInfo.accountCode,
         TaxType: "OUTPUT",
         Tracking: [
@@ -555,7 +555,7 @@ function buildJournalLines(stockTypeAmounts, branchName) {
   if (Math.abs(totalGstOnIncome) > 0.01) {
     journalLines.push({
       Description: "POS Clearing",
-      LineAmount: totalGstOnIncome, // 양수
+      LineAmount: -Math.abs(totalGstOnIncome), // 음수 (Credit)
       AccountCode: CLEARING_ACCOUNT_CODE,
       TaxType: "NONE",
       Tracking: [
@@ -586,7 +586,7 @@ function buildJournalLines(stockTypeAmounts, branchName) {
     if (Math.abs(gstFreeIncome) > 0.01) {
       journalLines.push({
         Description: stockTypeInfo.description,
-        LineAmount: -Math.abs(gstFreeIncome), // 음수 (Income)
+        LineAmount: Math.abs(gstFreeIncome), // 양수 (Debit)
         AccountCode: stockTypeInfo.accountCode,
         TaxType: "EXEMPTOUTPUT",
         Tracking: [
@@ -605,7 +605,7 @@ function buildJournalLines(stockTypeAmounts, branchName) {
   if (Math.abs(totalGstFreeIncome) > 0.01) {
     journalLines.push({
       Description: "POS Clearing",
-      LineAmount: totalGstFreeIncome, // 양수
+      LineAmount: -Math.abs(totalGstFreeIncome), // 음수 (Credit)
       AccountCode: CLEARING_ACCOUNT_CODE,
       TaxType: "NONE",
       Tracking: [
