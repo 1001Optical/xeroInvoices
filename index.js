@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import axios from 'axios';
 import mysql from 'mysql2/promise';
 import pLimit from 'p-limit';
-import { BRANCHES, STOCK_TYPES, CLEARING_ACCOUNT_CODE, PAYMENT_TYPES } from './constants.js';
+import { BRANCHES, STOCK_TYPES, CLEARING_ACCOUNT_CODE, PAYMENT_TYPES, CLEARING_ACCOUNT_CODES } from './constants.js';
 
 // 환경 변수 로드
 dotenv.config();
@@ -47,6 +47,39 @@ async function ensureTableExists() {
     `);
   } catch (error) {
     console.error('테이블 생성 실패:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * xero_clearing_lines 테이블 생성 (없으면 자동 생성)
+ * Manual Journal 라인과 Bank/Receive Money 라인을 저장하는 테이블
+ */
+async function ensureClearingTableExists() {
+  try {
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS xero_clearing_lines (
+        id BIGINT AUTO_INCREMENT PRIMARY KEY,
+        journal_id CHAR(36) NOT NULL,
+        line_number INT NOT NULL,
+        journal_number INT NULL,
+        date DATE NOT NULL,
+        account_code VARCHAR(10) NOT NULL,
+        source_type VARCHAR(50) NULL,
+        description VARCHAR(255) NULL,
+        reference VARCHAR(255) NULL,
+        debit DECIMAL(12,2) NOT NULL,
+        credit DECIMAL(12,2) NOT NULL,
+        signed_amount DECIMAL(12,2) NOT NULL,
+        origin ENUM('MJ','BANK','OTHER') NULL,
+        settled TINYINT(1) DEFAULT 0,
+        settled_at DATETIME NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY uniq_line (journal_id, line_number, account_code)
+      )
+    `);
+  } catch (error) {
+    console.error('xero_clearing_lines 테이블 생성 실패:', error.message);
     throw error;
   }
 }
@@ -713,6 +746,168 @@ async function createManualJournal(manualJournalData) {
 }
 
 /**
+ * Xero Journals API에서 Clearing 계정 라인을 동기화하는 함수
+ * 지정된 날짜 범위의 Journals를 가져와서 Clearing 계정 라인만 필터링하여 DB에 upsert
+ * @param {string} fromDate - 시작 날짜 (YYYY-MM-DD 형식, 예: '2025-10-01')
+ * @param {string} toDate - 종료 날짜 (YYYY-MM-DD 형식, 예: '2025-10-31')
+ * @returns {Promise<Object>} 동기화 결과 (upsert된 라인 수 등)
+ */
+async function syncClearingLines(fromDate, toDate) {
+  try {
+    // Access Token 가져오기
+    const accessToken = await getAccessToken();
+    
+    // 날짜 형식 검증
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(fromDate) || !dateRegex.test(toDate)) {
+      throw new Error('날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형식을 사용하세요.');
+    }
+    
+    // Xero where 파라미터 생성
+    // YYYY-MM-DD를 DateTime(YYYY,MM,DD) 형식으로 변환
+    const fromParts = fromDate.split('-');
+    const toParts = toDate.split('-');
+    const where = `JournalDate>=DateTime(${fromParts[0]},${parseInt(fromParts[1])},${parseInt(fromParts[2])})&&JournalDate<=DateTime(${toParts[0]},${parseInt(toParts[1])},${parseInt(toParts[2])})`;
+    
+    let offset = 0;
+    const pageSize = 100;
+    let totalUpserted = 0;
+    let hasMore = true;
+    
+    console.log(`📥 Clearing 계정 라인 동기화 시작: ${fromDate} ~ ${toDate}`);
+    
+    // Pagination 루프
+    while (hasMore) {
+      const url = `https://api.xero.com/api.xro/2.0/Journals?offset=${offset}&where=${encodeURIComponent(where)}`;
+      
+      const response = await axios.get(url, {
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Xero-tenant-id': process.env.XERO_TENANT_ID,
+          'Accept': 'application/json'
+        }
+      });
+      
+      const journals = response.data.Journals || [];
+      
+      if (journals.length === 0) {
+        hasMore = false;
+        break;
+      }
+      
+      // 각 Journal 처리
+      for (const journal of journals) {
+        const journalId = journal.JournalID;
+        const journalNumber = journal.JournalNumber || null;
+        const journalDate = journal.JournalDate ? journal.JournalDate.split('T')[0] : null; // YYYY-MM-DD만 추출
+        const sourceType = journal.SourceType || null;
+        const reference = journal.Reference || null;
+        
+        // origin 분류
+        let origin = 'OTHER';
+        if (sourceType === 'MANUAL JOURNAL') {
+          origin = 'MJ';
+        } else if (sourceType === 'BANK' || sourceType === 'CASH') {
+          origin = 'BANK';
+        }
+        
+        const journalLines = journal.JournalLines || [];
+        
+        // 각 JournalLine 처리
+        for (let i = 0; i < journalLines.length; i++) {
+          const line = journalLines[i];
+          const accountCode = line.AccountCode;
+          
+          // Clearing 계정 코드에 해당하는 라인만 처리
+          if (!CLEARING_ACCOUNT_CODES.includes(accountCode)) {
+            continue;
+          }
+          
+          // 라인 번호 결정 (LineNumber가 있으면 사용, 없으면 index 기반)
+          const lineNumber = line.LineNumber !== undefined ? line.LineNumber : (i + 1);
+          
+          // 금액 계산
+          const debit = Number(line.Debit || 0);
+          const credit = Number(line.Credit || 0);
+          const signedAmount = debit - credit; // Debit은 +, Credit은 -
+          
+          const description = line.Description || null;
+          
+          // Upsert 실행
+          // settled와 settled_at는 사용자가 체크하는 정보이므로 업데이트하지 않음
+          await db.query(`
+            INSERT INTO xero_clearing_lines (
+              journal_id, line_number, journal_number, date, account_code,
+              source_type, description, reference, debit, credit, signed_amount, origin
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE
+              journal_number = VALUES(journal_number),
+              date = VALUES(date),
+              source_type = VALUES(source_type),
+              description = VALUES(description),
+              reference = VALUES(reference),
+              debit = VALUES(debit),
+              credit = VALUES(credit),
+              signed_amount = VALUES(signed_amount),
+              origin = VALUES(origin)
+          `, [
+            journalId,
+            lineNumber,
+            journalNumber,
+            journalDate,
+            accountCode,
+            sourceType,
+            description,
+            reference,
+            debit,
+            credit,
+            signedAmount,
+            origin
+          ]);
+          
+          totalUpserted++;
+        }
+      }
+      
+      // 다음 페이지 확인
+      if (journals.length < pageSize) {
+        hasMore = false;
+      } else {
+        offset += pageSize;
+      }
+    }
+    
+    console.log(`✅ Clearing 계정 라인 동기화 완료: ${totalUpserted}개 라인 upsert됨`);
+    
+    return {
+      success: true,
+      fromDate,
+      toDate,
+      totalUpserted
+    };
+    
+  } catch (error) {
+    console.error('\n❌ Clearing 계정 라인 동기화 실패:');
+    console.error('상태 코드:', error.response?.status);
+    console.error('에러 응답:', JSON.stringify(error.response?.data, null, 2));
+    console.error('에러 메시지:', error.message);
+    
+    if (error.response?.status === 401) {
+      console.error('\n🔴 401 에러 - 인증 실패 원인:');
+      console.error('1. Access Token이 유효하지 않거나 만료되었습니다');
+      console.error('2. Tenant ID가 올바르지 않습니다 (현재:', process.env.XERO_TENANT_ID, ')');
+      console.error('3. API 권한(scope)이 부족합니다 - accounting.reports.read 권한 필요');
+    } else if (error.response?.status === 403) {
+      console.error('\n🔴 403 에러 - 권한 부족:');
+      console.error('Xero 앱에 Journals 조회 권한이 없습니다');
+      console.error('Xero 개발자 포털에서 스코프를 확인하세요');
+    }
+    
+    throw error;
+  }
+}
+
+/**
  * 특정 브랜치와 날짜에 대해 Manual Journal 생성
  * @param {string} branchCode - 브랜치 코드 (예: 'PA1')
  * @param {Date} date - 처리할 날짜 (formatOptomateDate가 전날을 반환하므로 하루 더한 날짜)
@@ -795,6 +990,7 @@ async function main() {
     
     // 테이블 생성 (없으면 자동 생성)
     await ensureTableExists();
+    await ensureClearingTableExists();
     
     // Refresh Token 확인
     const storedToken = await getStoredRefreshToken();
@@ -870,6 +1066,235 @@ async function main() {
     process.exit(1);
   }
 }
+
+/**
+ * GET /api/clearing - Clearing 계정 라인 조회 API
+ * 특정 Clearing 계정 + 날짜 범위에 대해 날짜별로 그룹핑하여 반환
+ * 
+ * 쿼리 파라미터:
+ * - accountCode (필수): Clearing 계정 코드 (예: '18000')
+ * - from (필수): 시작 날짜 (YYYY-MM-DD 형식)
+ * - to (필수): 종료 날짜 (YYYY-MM-DD 형식)
+ * - includeSettled (선택): true이면 settled=1도 포함, 기본값 false
+ */
+app.get('/api/clearing', async (req, res) => {
+  try {
+    // 쿼리 파라미터 추출
+    const { accountCode, from, to, includeSettled } = req.query;
+    
+    // 필수 파라미터 검증
+    if (!accountCode || !from || !to) {
+      return res.status(400).json({
+        error: '필수 파라미터가 누락되었습니다.',
+        required: ['accountCode', 'from', 'to']
+      });
+    }
+    
+    // 날짜 형식 검증
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(from) || !dateRegex.test(to)) {
+      return res.status(400).json({
+        error: '날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형식을 사용하세요.'
+      });
+    }
+    
+    // includeSettled 파라미터 처리 (기본값 false)
+    const includeSettledFlag = includeSettled === 'true' || includeSettled === true;
+    
+    // Clearing 계정 코드 검증
+    if (!CLEARING_ACCOUNT_CODES.includes(accountCode)) {
+      return res.status(400).json({
+        error: '유효하지 않은 Clearing 계정 코드입니다.',
+        validCodes: CLEARING_ACCOUNT_CODES
+      });
+    }
+    
+    // MySQL 쿼리 구성
+    let query = `
+      SELECT 
+        id,
+        journal_id,
+        line_number,
+        journal_number,
+        date,
+        account_code,
+        source_type,
+        description,
+        reference,
+        debit,
+        credit,
+        signed_amount,
+        origin,
+        settled
+      FROM xero_clearing_lines
+      WHERE account_code = ?
+        AND date BETWEEN ? AND ?
+    `;
+    
+    const queryParams = [accountCode, from, to];
+    
+    // includeSettled가 false이면 settled=0만 조회
+    if (!includeSettledFlag) {
+      query += ' AND settled = 0';
+    }
+    
+    query += ' ORDER BY date ASC, id ASC';
+    
+    // 데이터 조회
+    const [rows] = await db.query(query, queryParams);
+    
+    // 날짜별로 그룹핑
+    const groupsMap = new Map();
+    
+    for (const row of rows) {
+      const date = row.date.toISOString().split('T')[0]; // YYYY-MM-DD 형식
+      
+      if (!groupsMap.has(date)) {
+        groupsMap.set(date, {
+          date,
+          totalDebit: 0,
+          totalCredit: 0,
+          net: 0,
+          settled: 0,
+          lines: []
+        });
+      }
+      
+      const group = groupsMap.get(date);
+      
+      // 합계 계산
+      group.totalDebit += Number(row.debit || 0);
+      group.totalCredit += Number(row.credit || 0);
+      group.net += Number(row.signed_amount || 0);
+      
+      // settled는 그룹 내 라인 중 하나라도 settled=1이면 1
+      if (row.settled === 1) {
+        group.settled = 1;
+      }
+      
+      // 라인 정보 추가
+      group.lines.push({
+        id: row.id,
+        journalId: row.journal_id,
+        journalNumber: row.journal_number,
+        sourceType: row.source_type,
+        origin: row.origin,
+        description: row.description,
+        reference: row.reference,
+        debit: Number(row.debit || 0),
+        credit: Number(row.credit || 0),
+        signedAmount: Number(row.signed_amount || 0)
+      });
+    }
+    
+    // Map을 배열로 변환하고 autoBalanced 계산
+    const groups = Array.from(groupsMap.values()).map(group => {
+      // autoBalanced: net이 0에 가까우면 true (부동소수점 오차 허용)
+      const autoBalanced = Math.abs(group.net) < 0.01;
+      
+      return {
+        ...group,
+        autoBalanced,
+        // 숫자 정밀도 보정 (소수점 2자리)
+        totalDebit: Math.round(group.totalDebit * 100) / 100,
+        totalCredit: Math.round(group.totalCredit * 100) / 100,
+        net: Math.round(group.net * 100) / 100
+      };
+    });
+    
+    // 응답 반환
+    res.json({
+      accountCode,
+      from,
+      to,
+      groups
+    });
+    
+  } catch (error) {
+    console.error('Clearing 조회 API 오류:', error.message);
+    res.status(500).json({
+      error: '서버 오류가 발생했습니다.',
+      message: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/clearing/settle - Clearing 계정 라인의 정산 상태 업데이트 API
+ * 특정 Clearing 계정 + 날짜 그룹의 settled 상태를 업데이트
+ * 
+ * 요청 바디:
+ * - accountCode (필수): Clearing 계정 코드 (예: '18000')
+ * - date (필수): 날짜 (YYYY-MM-DD 형식)
+ * - settled (필수): 정산 상태 (true = 정산 완료, false = 미정산)
+ */
+app.post('/api/clearing/settle', async (req, res) => {
+  try {
+    const { accountCode, date, settled } = req.body;
+    
+    // 필수 파라미터 검증
+    if (!accountCode || !date || settled === undefined) {
+      return res.status(400).json({
+        error: '필수 파라미터가 누락되었습니다.',
+        required: ['accountCode', 'date', 'settled']
+      });
+    }
+    
+    // 날짜 형식 검증
+    const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
+    if (!dateRegex.test(date)) {
+      return res.status(400).json({
+        error: '날짜 형식이 올바르지 않습니다. YYYY-MM-DD 형식을 사용하세요.'
+      });
+    }
+    
+    // settled 값 검증 (boolean 또는 'true'/'false' 문자열)
+    const settledValue = settled === true || settled === 'true' ? 1 : 0;
+    
+    // Clearing 계정 코드 검증
+    if (!CLEARING_ACCOUNT_CODES.includes(accountCode)) {
+      return res.status(400).json({
+        error: '유효하지 않은 Clearing 계정 코드입니다.',
+        validCodes: CLEARING_ACCOUNT_CODES
+      });
+    }
+    
+    // MySQL UPDATE 쿼리 실행
+    // settled = 1이면 settled_at = NOW(), settled = 0이면 settled_at = NULL
+    const [result] = await db.query(`
+      UPDATE xero_clearing_lines
+      SET settled = ?, settled_at = (CASE WHEN ? = 1 THEN NOW() ELSE NULL END)
+      WHERE account_code = ? AND date = ?
+    `, [settledValue, settledValue, accountCode, date]);
+    
+    // 업데이트된 행 수 확인
+    const affectedRows = result.affectedRows;
+    
+    if (affectedRows === 0) {
+      return res.status(404).json({
+        error: '해당 조건의 데이터를 찾을 수 없습니다.',
+        accountCode,
+        date
+      });
+    }
+    
+    // 성공 응답
+    res.json({
+      success: true,
+      accountCode,
+      date,
+      settled: settledValue === 1,
+      affectedRows
+    });
+    
+  } catch (error) {
+    console.error('Clearing 정산 상태 업데이트 API 오류:', error.message);
+    res.status(500).json({
+      error: '서버 오류가 발생했습니다.',
+      message: error.message
+    });
+  }
+});
 
 // 스크립트 실행
 main();

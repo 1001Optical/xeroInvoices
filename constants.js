@@ -35,6 +35,17 @@ export const STOCK_TYPES = [
 // POS Clearing Account Code
 export const CLEARING_ACCOUNT_CODE = "18011";
 
+// Clearing 계정 코드 목록 (Xero Journals 동기화용)
+export const CLEARING_ACCOUNT_CODES = [
+  '18000', // Clearing - Cash
+  '18001', // Clearing - Eftpos
+  '18002', // Clearing - Amex
+  '18003', // Clearing - Hicaps
+  '18004', // Clearing - BNPL
+  '18005', // Clearing - Direct Deposit
+  '18006', // Clearing - PayPal
+];
+
 export const PAYMENT_TYPES = [
   { code: "EFT", description: "EFTPOS - Cheque/Savings", accountCode: "18001" },
   { code: "VIS", description: "EFTPOS - Visa", accountCode: "18001" },
