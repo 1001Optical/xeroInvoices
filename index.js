@@ -1230,13 +1230,11 @@ app.post('/api/clearing/settle', async (req, res) => {
 // 스크립트 실행
 main();
 
-const httpPort = process.env.HTTP_PORT || process.env.PORT;
-if (httpPort) {
-  app.listen(Number(httpPort), '0.0.0.0', () => {
-    console.log(
-      `HTTP 서버: ${httpPort} (Gmail Pub/Sub POST /webhooks/gmail/pubsub, GET /webhooks/gmail/health)`
-    );
-  });
-}
+const httpPort = Number(process.env.PORT || 8080);
+app.listen(httpPort, '0.0.0.0', () => {
+  console.log(
+    `HTTP 서버: ${httpPort} (Gmail Pub/Sub POST /webhooks/gmail/pubsub, GET /webhooks/gmail/health)`
+  );
+});
 
 export default app;
