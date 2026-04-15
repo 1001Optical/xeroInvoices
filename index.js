@@ -1,9 +1,24 @@
+/**
+ * Xero identity(connect/token) 직접 호출은 1001server/utils/xero.js 에만 있습니다.
+ * 다른 프로세스는 GET /api/internal/xero/access-token (XERO_INTERNAL_API_KEY) 을 사용하세요.
+ */
 import express from 'express';
 import dotenv from 'dotenv';
 import axios from 'axios';
 import mysql from 'mysql2/promise';
 import pLimit from 'p-limit';
 import { BRANCHES, STOCK_TYPES, CLEARING_ACCOUNT_CODE, PAYMENT_TYPES, CLEARING_ACCOUNT_CODES } from './constants.js';
+import {
+  initXeroTokenService,
+  getAccessToken,
+  getStoredRefreshTokenForEntity,
+  ensureXeroTokensReady,
+  DEFAULT_ENTITY,
+  getTenantIdForEntity
+} from './1001server/utils/xero.js';
+import { registerInternalXeroBeforeApiGuard } from './1001server/server.js';
+import { gmailPubSubRouter } from './1001server/routes/gmailPubSub.js';
+import { rootEndpointsDocumentation } from './1001server/routes/index.js';
 
 // 환경 변수 로드
 dotenv.config();
@@ -13,7 +28,6 @@ const app = express();
 // JSON 파싱 미들웨어
 app.use(express.json());
 
-// MySQL 연결 풀 생성
 const db = mysql.createPool({
   host: process.env.MYSQL_HOST || '127.0.0.1',
   port: parseInt(process.env.MYSQL_PORT || '3307'),
@@ -25,6 +39,16 @@ const db = mysql.createPool({
   queueLimit: 0
 });
 
+initXeroTokenService(db);
+app.use('/webhooks/gmail', gmailPubSubRouter);
+registerInternalXeroBeforeApiGuard(app);
+
+app.get('/', (req, res) => {
+  res.json({
+    ok: true,
+    endpoints: rootEndpointsDocumentation
+  });
+});
 
 // # 모든 브랜치 처리 (날짜는 항상 당일)
 // node index.js
@@ -85,127 +109,21 @@ async function ensureClearingTableExists() {
 }
 
 /**
- * MySQL에서 저장된 Refresh Token 가져오기
- * @returns {Promise<string|null>} Refresh Token 또는 null
- */
-async function getStoredRefreshToken() {
-  try {
-    const [rows] = await db.query('SELECT refresh_token FROM xero_tokens WHERE id = 1');
-    if (rows && rows.length > 0) {
-      return rows[0].refresh_token;
-    }
-    return null;
-  } catch (error) {
-    console.error('MySQL에서 Refresh Token 조회 실패:', error.message);
-    throw error;
-  }
-}
-
-/**
- * MySQL에 Refresh Token 저장 또는 업데이트
- * @param {string} refreshToken - 새로운 Refresh Token
- */
-async function saveRefreshToken(refreshToken) {
-  try {
-    // 먼저 id=1이 존재하는지 확인
-    const [existing] = await db.query('SELECT id FROM xero_tokens WHERE id = 1');
-    
-    if (existing && existing.length > 0) {
-      // 업데이트
-      await db.query(
-        'UPDATE xero_tokens SET refresh_token = ? WHERE id = 1',
-        [refreshToken]
-      );
-    } else {
-      // 최초 삽입
-      await db.query(
-        'INSERT INTO xero_tokens (id, refresh_token) VALUES (1, ?)',
-        [refreshToken]
-      );
-    }
-  } catch (error) {
-    console.error('MySQL에 Refresh Token 저장 실패:', error.message);
-    throw error;
-  }
-}
-
-/**
- * Xero API Access Token을 Refresh Token으로부터 얻어오는 함수
- * MySQL에서 Refresh Token을 가져오고, 새 토큰이 있으면 저장함
- * @returns {Promise<string>} Access Token
- */
-async function getAccessToken() {
-  try {
-    const tokenUrl = 'https://identity.xero.com/connect/token';
-    
-    // 환경 변수 확인
-    if (!process.env.XERO_CLIENT_ID || !process.env.XERO_CLIENT_SECRET) {
-      throw new Error('필수 환경 변수가 설정되지 않았습니다. XERO_CLIENT_ID, XERO_CLIENT_SECRET을 확인하세요.');
-    }
-    
-    // MySQL에서 Refresh Token 가져오기
-    const refreshToken = await getStoredRefreshToken();
-    
-    if (!refreshToken) {
-      throw new Error('MySQL에 Refresh Token이 없습니다. 최초 설정을 진행하세요.');
-    }
-    
-    const params = new URLSearchParams();
-    params.append('grant_type', 'refresh_token');
-    params.append('refresh_token', refreshToken);
-    params.append('client_id', process.env.XERO_CLIENT_ID);
-    params.append('client_secret', process.env.XERO_CLIENT_SECRET);
-    
-    const response = await axios.post(tokenUrl, params.toString(), {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded'
-      }
-    });
-
-    const accessToken = response.data.access_token;
-    const newRefreshToken = response.data.refresh_token;
-    
-    if (!accessToken) {
-      throw new Error('Access Token이 응답에 포함되지 않았습니다.');
-    }
-    
-    // 새로운 Refresh Token이 응답에 있으면 MySQL에 저장
-    if (newRefreshToken && newRefreshToken !== refreshToken) {
-      await saveRefreshToken(newRefreshToken);
-    }
-    
-    return accessToken;
-  } catch (error) {
-    console.error('토큰 갱신 실패:');
-    console.error('상태 코드:', error.response?.status);
-    console.error('에러 응답:', JSON.stringify(error.response?.data, null, 2));
-    console.error('에러 메시지:', error.message);
-    
-    if (error.response?.status === 401) {
-      console.error('\n401 에러 - 인증 실패 원인:');
-      console.error('1. MySQL에 저장된 Refresh Token이 만료되었거나 유효하지 않습니다');
-      console.error('2. Client ID 또는 Client Secret이 잘못되었습니다');
-      console.error('3. Xero 개발자 포털에서 새로운 Refresh Token을 발급받아 MySQL에 저장하세요');
-    }
-    
-    throw error;
-  }
-}
-
-/**
  * Xero API 연결 테스트 (Tenant 정보 확인)
  * @param {string} accessToken - Access Token
+ * @param {string} entityName - ENTITY_CONFIG 법인명
  * @returns {Promise<Object>} Tenant 정보
  */
-async function testConnection(accessToken) {
+async function testConnection(accessToken, entityName) {
+  const tenantId = getTenantIdForEntity(entityName);
   try {
     const apiUrl = 'https://api.xero.com/api.xro/2.0/Organisation';
-    
+
     const response = await axios.get(apiUrl, {
       headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Xero-tenant-id': process.env.XERO_TENANT_ID,
-        'Accept': 'application/json'
+        Authorization: `Bearer ${accessToken}`,
+        'Xero-tenant-id': tenantId,
+        Accept: 'application/json'
       }
     });
 
@@ -214,12 +132,12 @@ async function testConnection(accessToken) {
     console.error('❌ 연결 테스트 실패:');
     console.error('상태 코드:', error.response?.status);
     console.error('에러 응답:', JSON.stringify(error.response?.data, null, 2));
-    
+
     if (error.response?.status === 401) {
       console.error('\n⚠️  401 에러 - 인증 실패!');
       console.error('가능한 원인:');
       console.error('1. Access Token이 유효하지 않음');
-      console.error('2. Tenant ID가 잘못됨 (현재 값:', process.env.XERO_TENANT_ID, ')');
+      console.error('2. Tenant ID가 잘못됨 (법인:', entityName, ', tenantId:', tenantId, ')');
       console.error('3. Refresh Token을 다시 발급받아야 함');
     }
     throw error;
@@ -688,29 +606,32 @@ function formatOptomateDate(date, hours = 13) {
 /**
  * Xero API에 Manual Journal을 생성하는 함수
  * @param {Object} manualJournalData - Manual Journal 데이터
+ * @param {string} [entityName=DEFAULT_ENTITY] - ENTITY_CONFIG 키와 동일한 법인명
  * @returns {Promise<Object>} 생성된 Manual Journal 응답
  */
-async function createManualJournal(manualJournalData) {
+async function createManualJournal(manualJournalData, entityName = DEFAULT_ENTITY) {
   try {
-    // Access Token 가져오기
-    const accessToken = await getAccessToken();
-    
-    // 먼저 연결 테스트 (Tenant 확인)
-    await testConnection(accessToken);
-    
+    const tenantId = getTenantIdForEntity(entityName);
+    if (!tenantId) {
+      throw new Error(`법인 "${entityName}"에 대한 Tenant ID 환경 변수가 비어 있습니다.`);
+    }
+
+    const accessToken = await getAccessToken(entityName);
+
+    await testConnection(accessToken, entityName);
+
     const apiUrl = 'https://api.xero.com/api.xro/2.0/ManualJournals';
-    
-    // Xero API는 ManualJournals 배열로 감싸서 요청해야 함
+
     const requestBody = {
       ManualJournals: [manualJournalData]
     };
-    
+
     const response = await axios.post(apiUrl, requestBody, {
       headers: {
-        'Authorization': `Bearer ${accessToken}`,
-        'Xero-tenant-id': process.env.XERO_TENANT_ID,
+        Authorization: `Bearer ${accessToken}`,
+        'Xero-tenant-id': tenantId,
         'Content-Type': 'application/json',
-        'Accept': 'application/json'
+        Accept: 'application/json'
       }
     });
 
@@ -720,11 +641,11 @@ async function createManualJournal(manualJournalData) {
     console.error('상태 코드:', error.response?.status);
     console.error('에러 응답:', JSON.stringify(error.response?.data, null, 2));
     console.error('에러 메시지:', error.message);
-    
+
     if (error.response?.status === 401) {
       console.error('\n🔴 401 에러 - 인증 실패 원인:');
       console.error('1. Access Token이 유효하지 않거나 만료되었습니다');
-      console.error('2. Tenant ID가 올바르지 않습니다 (현재:', process.env.XERO_TENANT_ID, ')');
+      console.error('2. Tenant ID가 올바르지 않습니다 (법인:', entityName, ')');
       console.error('3. API 권한(scope)이 부족합니다 - accounting.transactions 권한 필요');
       console.error('4. Refresh Token이 만료되었을 수 있습니다');
       console.error('\n해결 방법:');
@@ -754,9 +675,14 @@ async function createManualJournal(manualJournalData) {
  */
 async function syncClearingLines(fromDate, toDate) {
   try {
-    // Access Token 가져오기
-    const accessToken = await getAccessToken();
-    
+    const entityName = DEFAULT_ENTITY;
+    const tenantId = getTenantIdForEntity(entityName);
+    if (!tenantId) {
+      throw new Error('Clearing 동기화용 Tenant ID(XERO_TENANT_ID 등)가 비어 있습니다.');
+    }
+
+    const accessToken = await getAccessToken(entityName);
+
     // 날짜 형식 검증
     const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
     if (!dateRegex.test(fromDate) || !dateRegex.test(toDate)) {
@@ -782,9 +708,9 @@ async function syncClearingLines(fromDate, toDate) {
       
       const response = await axios.get(url, {
         headers: {
-          'Authorization': `Bearer ${accessToken}`,
-          'Xero-tenant-id': process.env.XERO_TENANT_ID,
-          'Accept': 'application/json'
+          Authorization: `Bearer ${accessToken}`,
+          'Xero-tenant-id': tenantId,
+          Accept: 'application/json'
         }
       });
       
@@ -895,7 +821,7 @@ async function syncClearingLines(fromDate, toDate) {
     if (error.response?.status === 401) {
       console.error('\n🔴 401 에러 - 인증 실패 원인:');
       console.error('1. Access Token이 유효하지 않거나 만료되었습니다');
-      console.error('2. Tenant ID가 올바르지 않습니다 (현재:', process.env.XERO_TENANT_ID, ')');
+      console.error('2. Tenant ID가 올바르지 않습니다 (법인:', entityName, ')');
       console.error('3. API 권한(scope)이 부족합니다 - accounting.reports.read 권한 필요');
     } else if (error.response?.status === 403) {
       console.error('\n🔴 403 에러 - 권한 부족:');
@@ -915,6 +841,11 @@ async function syncClearingLines(fromDate, toDate) {
  * @param {Function} limitFn - concurrency 제어 함수 (p-limit)
  */
 async function processBranchAndDate(branchCode, date, dateStr, limitFn) {
+  const branch = BRANCHES.find((b) => b.code === branchCode);
+  if (!branch) {
+    throw new Error(`브랜치를 찾을 수 없습니다: ${branchCode}`);
+  }
+  const entityName = branch.entity;
   const branchName = getBranchName(branchCode);
 
   // UTC 날짜 범위 설정 (현지 거래일 기준, +11:00 시간대)
@@ -961,10 +892,9 @@ async function processBranchAndDate(branchCode, date, dateStr, limitFn) {
     JournalLines: journalLines
   };
 
-  // Xero API에 Manual Journal 생성
-  const result = await createManualJournal(manualJournalData);
-  
-  console.log(`✅ ${branchName} (${dateStr}) - Manual Journal 생성 완료`);
+  const result = await createManualJournal(manualJournalData, entityName);
+
+  console.log(`✅ ${branchName} (${dateStr}) - Manual Journal 생성 완료 [${entityName}]`);
   return result;
 }
 
@@ -991,9 +921,10 @@ async function main() {
     // 테이블 생성 (없으면 자동 생성)
     await ensureTableExists();
     await ensureClearingTableExists();
-    
+    await ensureXeroTokensReady();
+
     // Refresh Token 확인
-    const storedToken = await getStoredRefreshToken();
+    const storedToken = await getStoredRefreshTokenForEntity(DEFAULT_ENTITY);
     if (!storedToken) {
       throw new Error('MySQL에 Refresh Token이 없습니다. 최초 설정을 진행하세요: npm run init');
     }
@@ -1298,5 +1229,14 @@ app.post('/api/clearing/settle', async (req, res) => {
 
 // 스크립트 실행
 main();
+
+const httpPort = process.env.HTTP_PORT || process.env.PORT;
+if (httpPort) {
+  app.listen(Number(httpPort), '0.0.0.0', () => {
+    console.log(
+      `HTTP 서버: ${httpPort} (Gmail Pub/Sub POST /webhooks/gmail/pubsub, GET /webhooks/gmail/health)`
+    );
+  });
+}
 
 export default app;

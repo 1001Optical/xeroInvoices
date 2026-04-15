@@ -1,3 +1,7 @@
+/**
+ * Refresh Token DB 저장용 스크립트입니다.
+ * identity.xero.com/connect/token 호출은 1001server/utils/xero.js 만 사용합니다.
+ */
 import dotenv from 'dotenv';
 import mysql from 'mysql2/promise';
 
