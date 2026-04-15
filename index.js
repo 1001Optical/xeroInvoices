@@ -4,6 +4,8 @@
  */
 import express from 'express';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import axios from 'axios';
 import mysql from 'mysql2/promise';
 import pLimit from 'p-limit';
@@ -20,8 +22,9 @@ import { registerInternalXeroBeforeApiGuard } from './1001server/server.js';
 import { gmailPubSubRouter } from './1001server/routes/gmailPubSub.js';
 import { rootEndpointsDocumentation } from './1001server/routes/index.js';
 
-// 환경 변수 로드
-dotenv.config();
+// 환경 변수 로드 (PM2 등 cwd가 달라도 index.js 기준으로 .env 로드)
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: path.join(__dirname, '.env') });
 
 const app = express();
 
