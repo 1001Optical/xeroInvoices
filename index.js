@@ -997,8 +997,30 @@ async function main() {
     
   } catch (error) {
     console.error('오류 발생:', error.message);
-    process.exit(1);
+    if (process.env.BATCH_EXIT_ON_ERROR === '1') {
+      process.exit(1);
+    }
   }
+}
+
+function batchEnvReady() {
+  return Boolean(
+    process.env.XERO_TENANT_ID &&
+      process.env.OPTOMATE_API_BASE &&
+      process.env.OPTOMATE_USERNAME &&
+      process.env.OPTOMATE_PASSWORD
+  );
+}
+
+function warnSkippedBatch() {
+  const missing = [];
+  if (!process.env.XERO_TENANT_ID) missing.push('XERO_TENANT_ID');
+  if (!process.env.OPTOMATE_API_BASE) missing.push('OPTOMATE_API_BASE');
+  if (!process.env.OPTOMATE_USERNAME) missing.push('OPTOMATE_USERNAME');
+  if (!process.env.OPTOMATE_PASSWORD) missing.push('OPTOMATE_PASSWORD');
+  console.warn('[배치] Optomate→Xero 일일 동기화를 건너뜁니다.');
+  console.warn(`[배치] 미설정 변수: ${missing.join(', ')}`);
+  console.warn(`[배치] 이 파일 옆에 .env 를 두거나 PM2 ecosystem env 에 넣으세요: ${path.join(__dirname, '.env')}`);
 }
 
 /**
@@ -1230,8 +1252,12 @@ app.post('/api/clearing/settle', async (req, res) => {
   }
 });
 
-// 스크립트 실행
-main();
+// 일일 배치: 필수 환경 변수가 있을 때만 실행 (없으면 HTTP 서버만 기동 — PM2 재시작 루프 방지)
+if (batchEnvReady()) {
+  void main();
+} else {
+  warnSkippedBatch();
+}
 
 const httpPort = Number(process.env.PORT || 8080);
 app.listen(httpPort, '0.0.0.0', () => {
