@@ -16,6 +16,13 @@
     {code:'MQU', name:'Macquarie', entity:'SK Eyecare Pty Ltd'},
     {code:'TOP', name:'Top Ryde', entity:'JSJ Eyecare Pty Ltd'},
     {code:'IND', name:'Indooroopilly', entity:'1001 Indooroopilly Pty Ltd'},
+    {
+      code: 'NTL',
+      name: 'Online',
+      entity: '1001 Optical Pty Ltd',
+      /** PDF SOLD TO 등에 매장명 대신 이 문구로 오는 경우 (Hoya 등) */
+      invoiceAliases: ['1001 OPTICAL CENTRAL DISTRIBUTION', 'OPTICAL CENTRAL DISTRIBUTION']
+    }
   ]
   
 

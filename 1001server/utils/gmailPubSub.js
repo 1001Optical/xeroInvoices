@@ -3,6 +3,7 @@
  * @see https://cloud.google.com/pubsub/docs/push
  * @see https://developers.google.com/gmail/api/guides/push
  */
+import { runHoyaGmailPipeline } from './gmailHoyaPipeline.js';
 
 /**
  * Pub/Sub push 본문에서 Gmail 알림 JSON 추출
@@ -57,10 +58,14 @@ export function parsePubSubGmailNotification(body) {
 }
 
 /**
- * 이후 Gmail API history.list / messages.get 등으로 PDF 처리할 훅 (지금은 로그용)
+ * Hoya Daily Combined Invoice PDF 파이프라인 (비동기, await 하지 않음)
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
-export async function onGmailPubSubNotification(parsed) {
+export function onGmailPubSubNotification(parsed) {
+  if (parsed?.parseError) {
+    console.log('[Gmail Pub/Sub]', parsed.parseError, parsed.subscription || '');
+    return;
+  }
   if (parsed?.gmail?.emailAddress && parsed?.gmail?.historyId) {
     console.log(
       '[Gmail Pub/Sub] 알림:',
@@ -68,7 +73,8 @@ export async function onGmailPubSubNotification(parsed) {
       'historyId=',
       parsed.gmail.historyId
     );
-  } else if (parsed?.parseError) {
-    console.log('[Gmail Pub/Sub]', parsed.parseError, parsed.subscription || '');
   }
+  void runHoyaGmailPipeline(parsed).catch((err) => {
+    console.error('[Hoya pipeline]', err.message);
+  });
 }

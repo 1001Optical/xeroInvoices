@@ -28,4 +28,7 @@ Thumbs.db
 dist/
 build/
 
+# Gmail API historyId 체크포인트
+data/
+
 .env

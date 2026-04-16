@@ -43,9 +43,8 @@ gmailPubSubRouter.post('/pubsub', async (req, res) => {
       return res.status(400).json({ error: 'Invalid body' });
     }
 
-    await onGmailPubSubNotification(parsed);
+    onGmailPubSubNotification(parsed);
 
-    // Pub/Sub는 빠른 2xx 응답을 기대; 실패 시 재시도됨
     return res.status(204).send();
   } catch (err) {
     console.error('[Gmail Pub/Sub] handler error:', err.message);
