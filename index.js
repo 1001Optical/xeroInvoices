@@ -61,6 +61,19 @@ if (!internalXeroAuthKey) {
   );
 }
 
+const tokenBaseUrlHint =
+  process.env.XERO_INTERNAL_TOKEN_BASE_URL?.trim() ||
+  process.env.SERVER_BASE_URL?.trim() ||
+  process.env.BACKEND_URL?.trim();
+const xeroRefreshIssuer = /^(1|true|yes)$/i.test(
+  String(process.env.XERO_ISSUE_TOKENS_HERE || '').trim()
+);
+if (useMysql && internalXeroAuthKey && tokenBaseUrlHint && !xeroRefreshIssuer) {
+  console.warn(
+    '[xero] MySQL 풀 + 내부 토큰 URL/키가 같이 있습니다. 이 인스턴스가 DB(xero_tokens)로 /api/internal/xero/access-token 을 발급하면 XERO_ISSUE_TOKENS_HERE=1 을 넣으세요. Hoya 등 **소비 워커만**이면 이 경고는 무시해도 됩니다.'
+  );
+}
+
 app.use('/webhooks/gmail', gmailPubSubRouter);
 registerInternalXeroBeforeApiGuard(app);
 

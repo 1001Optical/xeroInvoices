@@ -8,6 +8,10 @@
  *   이 내부 API는 쿼리와 무관하게 항상 xero_tokens id 1(DEFAULT_ENTITY) 기준 access·tenantId 만 반환.
  *   다른 법인 Xero 호출은 같은 access + 호출 쪽 .env 의 해당 Xero-tenant-id(UUID)를 씁니다.
  *
+ *   BACKEND_URL(또는 XERO_INTERNAL_TOKEN_BASE_URL) + XERO_INTERNAL_API_KEY|BACKEND_API_TOKEN 가 있으면
+ *   기본적으로 access 는 **항상** GET /api/internal/xero/access-token 만 사용 — 로컬 MySQL·XERO_RT_* refresh 조회 안 함.
+ *   예외: refresh 를 DB 에서 돌리는 **발급 서버**(index + xero_tokens) 에는 XERO_ISSUE_TOKENS_HERE=1 을 넣어 identity 경로 유지.
+ *
  * OAuth 앱(XERO_CLIENT_ID / XERO_CLIENT_SECRET)은 하나이고, 법인(엔티티)마다
  * 테넌트 UUID 는 ENTITY_CONFIG 의 tenantEnv 로 분리합니다.
  *
@@ -384,9 +388,23 @@ async function fetchAccessTokenFromInternalHttp(entityName) {
   return data.accessToken;
 }
 
+/**
+ * 내부 access-token URL+키가 있으면 워커·CLI 는 로컬 refresh 를 읽지 않고 HTTP 만 사용.
+ * 발급 전용 프로세스만 XERO_ISSUE_TOKENS_HERE=1 로 DB→identity 경로 유지.
+ */
+function isXeroRefreshIssuerProcess() {
+  return /^(1|true|yes)$/i.test(String(process.env.XERO_ISSUE_TOKENS_HERE || '').trim());
+}
+
+function shouldUseInternalHttpForRefresh() {
+  if (!usesInternalHttpAccessToken()) return false;
+  if (tokenPersistenceEnvOnly) return false;
+  if (isXeroRefreshIssuerProcess()) return false;
+  return true;
+}
+
 async function refreshAccessTokenInternal(entityName) {
-  /** CLI·워커만: 서버(index)는 pool 있음 → identity 유지(자기 자신 HTTP 호출 방지) */
-  if (usesInternalHttpAccessToken() && !poolRef && !tokenPersistenceEnvOnly) {
+  if (shouldUseInternalHttpForRefresh()) {
     return fetchAccessTokenFromInternalHttp(entityName);
   }
 
@@ -398,9 +416,15 @@ async function refreshAccessTokenInternal(entityName) {
   const cacheKey = tokenAnchorEntity(entityName);
   if (!refreshToken) {
     const cfg = resolveEntityConfig(cacheKey);
-    const hint = useSingleSharedXeroRefresh()
+    let hint = useSingleSharedXeroRefresh()
       ? `공유 Refresh 법인 "${cacheKey}" — MySQL xero_tokens.id=${cfg.id} 또는 ${cfg.tokenEnv}`
       : `법인 "${entityName}"의 Refresh Token이 없습니다. MySQL xero_tokens.id=${cfg.id} 또는 환경 변수 ${cfg.tokenEnv}`;
+    if (!usesInternalHttpAccessToken()) {
+      hint +=
+        ' — 미들웨어만 쓰려면 BACKEND_URL(또는 XERO_INTERNAL_TOKEN_BASE_URL) + XERO_INTERNAL_API_KEY|BACKEND_API_TOKEN 설정';
+    } else if (isXeroRefreshIssuerProcess()) {
+      hint += ' — 발급 서버(XERO_ISSUE_TOKENS_HERE=1)는 xero_tokens 또는 XERO_RT_* 확인';
+    }
     throw new Error(`${hint} 를 설정하세요.`);
   }
 
