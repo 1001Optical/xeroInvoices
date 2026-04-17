@@ -2,8 +2,9 @@
  * Hoya Daily Combined 메일 처리
  *
  * - 메일 1통에 PDF 첨부가 **여러 개**일 수 있음 → **각 PDF마다** 순차 처리
- * - 각 PDF는 **여러 페이지**일 수 있음 → **페이지 1장 = 인보이스 1건** (파싱 + Xero Bill + 해당 페이지 PDF 첨부)
+ * - 각 PDF는 **여러 페이지**일 수 있음 → **페이지 1장 = 인보이스 1건** (파싱 + Xero Bill 또는 Supplier Credit + 해당 페이지 PDF 첨부)
  * - 같은 메일 안에서 ref|date 중복은 스킵 (seenKeysThisMessage)
+ * - 한 PDF에서 실패해도 **다음 PDF**는 계속 시도 (예전에는 첫 실패 시 return false 로 뒤 첨부 미처리)
  */
 import { createPayableGmailClient } from './gmailPayableAuth.js';
 import {
@@ -17,7 +18,10 @@ import {
 } from './gmailHistoryState.js';
 import { parseHoyaCombinedPdf } from './hoyaPdfParser.js';
 import { splitPdfToSinglePageBuffers } from './pdfSplit.js';
-import { ensureHoyaAccPayAndAttach } from './xeroHoyaBills.js';
+import {
+  ensureHoyaAccPayAndAttach,
+  ensureHoyaSupplierCreditAndAttach
+} from './xeroHoyaBills.js';
 
 function sanitizeForFileRef(ref) {
   return String(ref).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 80);
@@ -39,16 +43,133 @@ function getHeader(headers, name) {
   return h?.value || '';
 }
 
-function collectPdfAttachments(part, acc) {
+/** Gmail API body.data (base64url) → Buffer */
+function decodeGmailBodyData(data) {
+  if (data == null || data === '') return null;
+  try {
+    const b64 = String(data).replace(/-/g, '+').replace(/_/g, '/');
+    return Buffer.from(b64, 'base64');
+  } catch {
+    return null;
+  }
+}
+
+function looksLikePdfPart(part) {
+  const mime = String(part.mimeType || '').toLowerCase();
+  const fn = String(part.filename || '');
+  if (mime === 'application/pdf' || mime === 'application/x-pdf') return true;
+  if (/-pdf|\/pdf$/i.test(mime)) return true;
+  if (/\.pdf$/i.test(fn)) return true;
+  if (
+    (mime === 'application/octet-stream' ||
+      mime === 'binary/octet-stream' ||
+      mime === 'application/force-download') &&
+    /\.pdf$/i.test(fn)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/** Buffer 앞부분이 PDF 인지 (앞쪽 공백 허용) — Gmail MIME 누락 시 sniff 용 */
+export function bufferLooksLikePdf(buf) {
+  if (!buf || buf.length < 4) return false;
+  if (buf.slice(0, 4).toString('latin1') === '%PDF') return true;
+  const head = buf.slice(0, Math.min(64, buf.length)).toString('latin1');
+  return /^\s*%PDF/.test(head);
+}
+
+/** 트리 순서대로 body.attachmentId 가 있는 모든 파트 (Gmail이 주는 첨부 전부) */
+function collectAllAttachmentPartsInOrder(part, list) {
   if (!part) return;
-  const mime = part.mimeType || '';
-  const filename = part.filename || '';
-  if ((mime === 'application/pdf' || /\.pdf$/i.test(filename)) && part.body?.attachmentId) {
-    acc.push({ attachmentId: part.body.attachmentId, filename: filename || 'attachment.pdf' });
+  if (part.body?.attachmentId) {
+    list.push({
+      attachmentId: part.body.attachmentId,
+      filename: part.filename || 'attachment'
+    });
   }
   if (Array.isArray(part.parts)) {
-    for (const p of part.parts) collectPdfAttachments(p, acc);
+    for (const p of part.parts) {
+      collectAllAttachmentPartsInOrder(p, list);
+    }
   }
+}
+
+function dedupeAttachmentsByIdInOrder(list) {
+  const seen = new Set();
+  const out = [];
+  for (const x of list) {
+    if (seen.has(x.attachmentId)) continue;
+    seen.add(x.attachmentId);
+    out.push(x);
+  }
+  return out;
+}
+
+/**
+ * messages.get format=full 의 payload 트리에서 PDF 첨부 수집.
+ * - 일반: body.attachmentId (별도 attachments.get)
+ * - 인라인/일부 메일 클라이언트: body.data 만 있고 attachmentId 없음
+ * - attachmentId + data 가 같이 있으면 attachmentId만 사용(중복 방지)
+ */
+function collectPdfAttachmentsWalk(part, acc, seenAttachmentIds) {
+  if (!part) return;
+  const filename = part.filename || 'attachment.pdf';
+
+  if (looksLikePdfPart(part)) {
+    const attId = part.body?.attachmentId;
+    if (attId) {
+      if (!seenAttachmentIds.has(attId)) {
+        seenAttachmentIds.add(attId);
+        acc.push({ attachmentId: attId, filename });
+      }
+    } else if (part.body?.data) {
+      const buf = decodeGmailBodyData(part.body.data);
+      if (buf && bufferLooksLikePdf(buf)) {
+        acc.push({ filename, buffer: buf });
+      }
+    }
+  }
+
+  if (Array.isArray(part.parts)) {
+    for (const p of part.parts) {
+      collectPdfAttachmentsWalk(p, acc, seenAttachmentIds);
+    }
+  }
+}
+
+/**
+ * @returns {Array<{
+ *   filename: string,
+ *   attachmentId?: string,
+ *   buffer?: Buffer,
+ *   sniffPdf?: boolean
+ * }>}
+ */
+export function collectPdfAttachmentsFromPayload(payload) {
+  const primary = [];
+  const seenPrimaryIds = new Set();
+  collectPdfAttachmentsWalk(payload, primary, seenPrimaryIds);
+
+  const primaryIdSet = new Set(
+    primary.map((p) => p.attachmentId).filter(Boolean)
+  );
+
+  const allAttach = [];
+  collectAllAttachmentPartsInOrder(payload, allAttach);
+  const uniqueAttach = dedupeAttachmentsByIdInOrder(allAttach);
+
+  const extra = [];
+  for (const a of uniqueAttach) {
+    if (primaryIdSet.has(a.attachmentId)) continue;
+    extra.push({
+      attachmentId: a.attachmentId,
+      filename: a.filename,
+      sniffPdf: true
+    });
+  }
+
+  return [...primary, ...extra];
 }
 
 function isHoyaDailyCombinedInvoice(headers) {
@@ -84,7 +205,7 @@ async function listRecentHoyaFallback(gmail, ids) {
  * @param {{ skipInvoiceDedupe?: boolean, skipPersistInvoiceKeys?: boolean }} [options]
  *   skipInvoiceDedupe — 이미 처리된 ref|date 인보이스도 다시 시도 (수동 테스트용)
  *   skipPersistInvoiceKeys — 성공해도 processedInvoiceKeys 에 저장하지 않음
- * @returns {Promise<boolean>} true = 이 메일은 완전히 끝났고 messageId 저장해도 됨
+ * @returns {Promise<boolean>} true = 이 메일 전부 성공, messageId 저장해도 됨. false = 일부 실패(재시도 가능); 성공한 인보이스 키는 이미 저장됨
  */
 async function processOneMessage(gmail, messageId, userEmail, options = {}) {
   const skipInvoiceDedupe = Boolean(options.skipInvoiceDedupe);
@@ -100,43 +221,76 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
     return true;
   }
 
-  const pdfs = [];
-  collectPdfAttachments(full.data.payload, pdfs);
+  const pdfs = collectPdfAttachmentsFromPayload(full.data.payload);
   if (pdfs.length === 0) {
     console.warn('[Hoya] PDF 첨부 없음 messageId=', messageId);
     return false;
   }
 
   const subj = getHeader(headers, 'Subject');
-  console.log('[Hoya] 처리:', subj, 'messageId=', messageId, 'pdf첨부개수=', pdfs.length);
+  const sniffN = pdfs.filter((p) => p.sniffPdf).length;
+  const directN = pdfs.length - sniffN;
+  console.log(
+    '[Hoya] 처리:',
+    subj,
+    'messageId=',
+    messageId,
+    '첨부후보=',
+    pdfs.length,
+    sniffN > 0 ? `(MIME로 PDF확정 ${directN}, 나머지 ${sniffN}개는 다운로드 후 시그니처 확인)` : ''
+  );
   if (pdfs.length > 0) {
-    console.log('[Hoya] PDF 파일:', pdfs.map((p) => p.filename));
+    console.log('[Hoya] 파일:', pdfs.map((p) => p.filename));
   }
 
-  /** 메일 단위 성공 후에만 DB에 씀 (중간 실패 시 인보이스 키도 남기지 않음) */
+  /** 성공한 인보이스 키 — 부분 성공 시에도 저장해 재시도 시 Xero 중복 방지 */
   const invoiceKeysToPersist = new Set();
   /** 이번 메일 안에서 이미 잡은 ref|date (같은 PDF/페이지 중복 방지) */
   const seenKeysThisMessage = new Set();
+  let messageHadFailure = false;
 
-  for (const { attachmentId, filename } of pdfs) {
+  for (const item of pdfs) {
+    const filename = item.filename;
     let buffer;
-    try {
-      const att = await gmail.users.messages.attachments.get({
-        userId: 'me',
-        messageId,
-        id: attachmentId
-      });
-      const b64 = att.data.data.replace(/-/g, '+').replace(/_/g, '/');
-      buffer = Buffer.from(b64, 'base64');
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
+    if (item.buffer) {
+      buffer = item.buffer;
+    } else if (item.attachmentId) {
+      try {
+        const att = await gmail.users.messages.attachments.get({
+          userId: 'me',
+          messageId,
+          id: item.attachmentId
+        });
+        const b64 = att.data.data.replace(/-/g, '+').replace(/_/g, '/');
+        buffer = Buffer.from(b64, 'base64');
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        messageHadFailure = true;
+        logPdfParseError({
+          messageId,
+          attachmentFilename: filename,
+          page: null,
+          error: `attachment download: ${msg}`
+        });
+        console.warn('[Hoya] 다음 PDF 첨부 계속 시도 (다운로드 실패)', filename);
+        continue;
+      }
+      if (item.sniffPdf && !bufferLooksLikePdf(buffer)) {
+        console.log(
+          '[Hoya] MIME 불명 첨부 스킵 (PDF 시그니처 아님)',
+          JSON.stringify({ messageId, filename, bytes: buffer.length })
+        );
+        continue;
+      }
+    } else {
+      messageHadFailure = true;
       logPdfParseError({
         messageId,
         attachmentFilename: filename,
         page: null,
-        error: `attachment download: ${msg}`
+        error: 'PDF 항목에 buffer·attachmentId 없음'
       });
-      return false;
+      continue;
     }
 
     let parsed;
@@ -144,13 +298,15 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
       parsed = await parseHoyaCombinedPdf(buffer, { attachmentFileName: filename });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      messageHadFailure = true;
       logPdfParseError({
         messageId,
         attachmentFilename: filename,
         page: null,
         error: `PDF open: ${msg}`
       });
-      return false;
+      console.warn('[Hoya] 다음 PDF 첨부 계속 시도 (PDF 열기 실패)', filename);
+      continue;
     }
 
     for (const pe of parsed.pageErrors) {
@@ -162,7 +318,9 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
       });
     }
     if (parsed.pageErrors.length > 0) {
-      return false;
+      messageHadFailure = true;
+      console.warn('[Hoya] 다음 PDF 첨부 계속 시도 (페이지 파싱 오류)', filename);
+      continue;
     }
 
     let pageBuffers;
@@ -170,36 +328,41 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
       pageBuffers = await splitPdfToSinglePageBuffers(buffer);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      messageHadFailure = true;
       logPdfParseError({
         messageId,
         attachmentFilename: filename,
         page: null,
         error: `pdf-lib split: ${msg}`
       });
-      return false;
+      console.warn('[Hoya] 다음 PDF 첨부 계속 시도 (split 실패)', filename);
+      continue;
     }
 
     if (pageBuffers.length !== parsed.invoices.length) {
+      messageHadFailure = true;
       logPdfParseError({
         messageId,
         attachmentFilename: filename,
         page: null,
         error: `페이지 수 불일치: split=${pageBuffers.length} parse=${parsed.invoices.length}`
       });
-      return false;
+      console.warn('[Hoya] 다음 PDF 첨부 계속 시도 (페이지 수 불일치)', filename);
+      continue;
     }
 
     for (const inv of parsed.invoices) {
       const ref = inv.referenceNumber;
       const dt = inv.invoiceDate;
       if (!ref || !dt) {
+        messageHadFailure = true;
         logPdfParseError({
           messageId,
           attachmentFilename: filename,
           page: inv.page,
           error: 'referenceNumber 또는 invoiceDate 없음 (Xero bill 불가)'
         });
-        return false;
+        continue;
       }
 
       const key = makeInvoiceKey(ref, dt);
@@ -238,18 +401,24 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
       const srcPrefix = attachmentNamePrefixFromFilename(filename);
       const attachName = `${srcPrefix}_${sanitizeForFileRef(ref)}_p${inv.page}.pdf`;
 
+      const xeroOpts = {
+        referenceNumber: ref,
+        invoiceDateStr: dt,
+        soldTo: inv.soldTo,
+        storeLine: inv.storeLine,
+        fullPageText: inv.rawText,
+        lineItems: inv.lineItems,
+        pagePdfBuffer: pagePdf,
+        attachmentFileName: attachName
+      };
       try {
-        await ensureHoyaAccPayAndAttach({
-          referenceNumber: ref,
-          invoiceDateStr: dt,
-          soldTo: inv.soldTo,
-          storeLine: inv.storeLine,
-          fullPageText: inv.rawText,
-          lineItems: inv.lineItems,
-          pagePdfBuffer: pagePdf,
-          attachmentFileName: attachName
-        });
+        if (inv.documentKind === 'supplier_credit_note') {
+          await ensureHoyaSupplierCreditAndAttach(xeroOpts);
+        } else {
+          await ensureHoyaAccPayAndAttach(xeroOpts);
+        }
       } catch (err) {
+        messageHadFailure = true;
         const msg = err instanceof Error ? err.message : String(err);
         const xero = err.response?.data;
         console.error(
@@ -259,11 +428,13 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
             attachmentFilename: filename,
             page: inv.page,
             referenceNumber: ref,
+            documentKind: inv.documentKind || 'supplier_invoice',
             error: msg,
             xero: xero || null
           })
         );
-        return false;
+        console.warn('[Hoya] 이 페이지 건너뜀, 같은 메일의 다른 PDF·페이지 계속');
+        continue;
       }
 
       seenKeysThisMessage.add(key);
@@ -278,6 +449,7 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
           {
             referenceNumber: inv.referenceNumber,
             invoiceDate: inv.invoiceDate,
+            documentKind: inv.documentKind,
             storeLine: inv.storeLine,
             soldTo: inv.soldTo,
             lineItems: inv.lineItems
@@ -300,6 +472,13 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
     );
   }
 
+  if (messageHadFailure) {
+    console.warn(
+      '[Hoya] 메일 일부 실패 — messageId 재처리 가능, 성공분 인보이스 키는 이미 저장됨',
+      messageId
+    );
+    return false;
+  }
   return true;
 }
 

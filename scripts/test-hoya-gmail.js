@@ -6,6 +6,8 @@
  *   node scripts/test-hoya-gmail.js list
  *   node scripts/test-hoya-gmail.js list --q 'from:axd365au@hoya.com newer_than:2d'
  *   node scripts/test-hoya-gmail.js list --date 2026-04-14
+ *   (같은 날 메일이 여러 통인데 ID가 하나만 나올 때: 제목이 조금 다르면 기본 검색에서 빠짐 → 아래 --loose)
+ *   node scripts/test-hoya-gmail.js list --date 2026-04-16 --loose
  *
  * 특정 messageId 처리 (Gmail 웹 → 메일 열기 → URL의 /.../메시지ID):
  *   node scripts/test-hoya-gmail.js run <messageId> [--force] [--mysql]
@@ -17,8 +19,12 @@
  * --force: 이미 처리된 인보이스(ref|date)여도 다시 Xero까지 시도 (같은 Reference면 Bill은 재생성 안 됨)
  *
  * PDF에서 실제로 어떤 텍스트가 추출되는지 (인보이스 번호/날짜 못 찾을 때):
- *   node scripts/test-hoya-gmail.js inspect <messageId> [--pdf N] [--out path.json]
+ *   node scripts/test-hoya-gmail.js inspect <messageId> [--pdf N] [--out path.json] [--file-only]
+ *   (기본: 전체 JSON 을 터미널에도 출력. 길면 --file-only 로 파일만 저장)
  *   → 첨부 PDF가 여러 개면 **전부** 덤프 (특정 것만: --pdf 0 첫 번째)
+ *
+ * Gmail API가 첨부를 몇 개로 노출하는지 (웹에서 PDF 두 개인데 API는 1개일 때):
+ *   node scripts/test-hoya-gmail.js payload <messageId>
  */
 import dotenv from 'dotenv';
 import fs from 'fs/promises';
@@ -26,7 +32,11 @@ import mysql from 'mysql2/promise';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createPayableGmailClient } from '../1001server/utils/gmailPayableAuth.js';
-import { processHoyaGmailMessage } from '../1001server/utils/gmailHoyaPipeline.js';
+import {
+  bufferLooksLikePdf,
+  collectPdfAttachmentsFromPayload,
+  processHoyaGmailMessage
+} from '../1001server/utils/gmailHoyaPipeline.js';
 import { inspectHoyaPdfBuffer } from '../1001server/utils/hoyaPdfParser.js';
 import { initXeroTokenService, initXeroTokenServiceEnvOnly } from '../1001server/utils/xero.js';
 
@@ -50,10 +60,103 @@ function createMysqlPool() {
 
 function usage() {
   console.log(`Usage:
-  node scripts/test-hoya-gmail.js list [--date YYYY-MM-DD] [--q "gmail query"] [--max N]
+  node scripts/test-hoya-gmail.js list [--date YYYY-MM-DD] [--loose] [--q "gmail query"] [--max N]
   node scripts/test-hoya-gmail.js run <messageId> [--force] [--mysql]
-  node scripts/test-hoya-gmail.js inspect <messageId> [--pdf N] [--out path.json]
+  node scripts/test-hoya-gmail.js inspect <messageId> [--pdf N] [--out path.json] [--file-only]
+  node scripts/test-hoya-gmail.js payload <messageId>
 `);
+}
+
+/**
+ * Gmail messages.get — format=full 페이로드 트리 + format=raw MIME 힌트
+ * (웹 UI 첨부 개수와 API 불일치 원인 확인용)
+ */
+function walkPayloadParts(part, depth, lines) {
+  if (!part) return;
+  const pad = '  '.repeat(depth);
+  const attId = part.body?.attachmentId || '';
+  const dataLen = part.body?.data ? String(part.body.data).length : 0;
+  const mime = part.mimeType || '(no mimeType)';
+  const fn = part.filename || '';
+  lines.push(
+    `${pad}- ${mime}${fn ? ` ; filename=${JSON.stringify(fn)}` : ''}${attId ? ` ; attachmentId=${attId.slice(0, 12)}…` : ''}${dataLen ? ` ; body.data b64 길이≈${dataLen}` : ''}`
+  );
+  if (Array.isArray(part.parts)) {
+    for (const p of part.parts) {
+      walkPayloadParts(p, depth + 1, lines);
+    }
+  }
+}
+
+function countAttachmentIdsInPayload(part) {
+  let n = 0;
+  if (!part) return 0;
+  if (part.body?.attachmentId) n += 1;
+  if (Array.isArray(part.parts)) {
+    for (const p of part.parts) n += countAttachmentIdsInPayload(p);
+  }
+  return n;
+}
+
+async function dumpGmailMessagePayload(gmail, messageId) {
+  const full = await gmail.users.messages.get({
+    userId: 'me',
+    id: messageId,
+    format: 'full'
+  });
+  const lines = [];
+  lines.push('=== format=full payload 트리 (Gmail API) ===');
+  walkPayloadParts(full.data.payload, 0, lines);
+  console.log(lines.join('\n'));
+  const nAtt = countAttachmentIdsInPayload(full.data.payload);
+  console.log(`\n→ 이 트리 안의 body.attachmentId 개수: ${nAtt}`);
+
+  const rawRes = await gmail.users.messages.get({
+    userId: 'me',
+    id: messageId,
+    format: 'raw'
+  });
+  const rawB64 = rawRes.data.raw;
+  if (!rawB64) {
+    console.log('\n(raw 형식 없음)');
+    return;
+  }
+  const buf = Buffer.from(
+    String(rawB64).replace(/-/g, '+').replace(/_/g, '/'),
+    'base64'
+  );
+  const rawLatin = buf.toString('latin1');
+  /** multipart 안 파트 헤더까지 포함하려면 전체 문자열에서 집계(본문 바이너리에 가끔 ASCII 가 겹칠 수 있으나 희귀) */
+  const cdAttachment = (rawLatin.match(/Content-Disposition:\s*attachment/gi) || [])
+    .length;
+  const ctPdf = (rawLatin.match(/Content-Type:\s*application\/pdf/gi) || [])
+    .length;
+  const fnPdfQuoted = (rawLatin.match(/filename="[^"]+\.pdf"/gi) || []).length;
+  const fnPdfStar = (rawLatin.match(/filename\*=UTF-8''[^;\s]+\.pdf/gi) || [])
+    .length;
+  const nameParamPdf = (rawLatin.match(
+    /(?:^|\r?\n)[^\n]*\bname=(?:"|'|)[^"'\r\n;]+\.pdf/gi
+  ) || []).length;
+  const headerLineMentionsPdf = (
+    rawLatin.match(
+      /(?:Content-(?:Type|Disposition)|^[\t ]*(?:filename|name)=)[^\n]*\.pdf/gim
+    ) || []
+  ).length;
+
+  console.log('\n=== format=raw RFC822 휴리스틱 (multipart 파트 헤더 포함, 본문 일부와 겹칠 수 있음) ===');
+  console.log(`전체 raw 바이트: ${buf.length}`);
+  console.log(`Content-Disposition: attachment 줄 수(대략): ${cdAttachment}`);
+  console.log(`Content-Type: application/pdf 줄 수(대략): ${ctPdf}`);
+  console.log(`filename="….pdf" (quoted) 개수(대략): ${fnPdfQuoted}`);
+  console.log(`filename*=UTF-8''….pdf 개수(대략): ${fnPdfStar}`);
+  console.log(`name=…\\.pdf 형태 줄(대략, octet-stream 에 흔함): ${nameParamPdf}`);
+  console.log(`헤더 줄 중 .pdf 가 들어간 첨부 관련 줄(대략): ${headerLineMentionsPdf}`);
+  console.log(
+    '\n해석: 첨부가 application/octet-stream; name="….pdf" 로만 오면 application/pdf·filename="…" 줄 수는 0일 수 있음(정상).'
+  );
+  console.log(
+    '※ 웹에서 PDF가 두 개인데 attachment·첨부 후보가 1이면, 두 번째는 MIME 첨부가 아니라 미리보기·ZIP·다른 메일일 수 있음.'
+  );
 }
 
 /** 로컬 달력 기준 "어제"의 Gmail after/before 구간 (하루) */
@@ -76,6 +179,20 @@ function yesterdayLocalYmd() {
   return `${y}-${m}-${day}`;
 }
 
+/** 내부 토큰 URL이 이 PC가 아닌 호스트를 가리키는지 (원격이면 그 서버의 env 가 따로 필요함) */
+function tokenBaseIsRemoteHost(baseUrl) {
+  const s = String(baseUrl || '').trim().replace(/\/$/, '');
+  if (!s) return false;
+  try {
+    const u = new URL(/^https?:\/\//i.test(s) ? s : `https://${s}`);
+    const h = (u.hostname || '').toLowerCase();
+    if (h === 'localhost' || h === '127.0.0.1' || h === '::1') return false;
+    return true;
+  } catch {
+    return true;
+  }
+}
+
 function parseArgs(argv) {
   const out = {
     cmd: null,
@@ -88,7 +205,11 @@ function parseArgs(argv) {
     /** @type {number|undefined} inspect 시 0부터, 생략 시 모든 PDF */
     pdfIndex: undefined,
     /** run 시 MySQL + xero_tokens 사용 (기본 false) */
-    useMysql: false
+    useMysql: false,
+    /** list: subject:"Daily Combined Invoice" 조건 생략 (같은 날 Hoya 메일 전부 볼 때) */
+    looseList: false,
+    /** inspect: JSON 을 터미널에 출력하지 않고 파일만 저장 */
+    inspectFileOnly: false
   };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -97,8 +218,12 @@ function parseArgs(argv) {
       out.cmd = 'run';
       out.messageId = argv[++i];
     } else if (a === '--mysql') out.useMysql = true;
+    else if (a === '--loose') out.looseList = true;
     else if (a === 'inspect') {
       out.cmd = 'inspect';
+      out.messageId = argv[++i];
+    } else if (a === 'payload') {
+      out.cmd = 'payload';
       out.messageId = argv[++i];
     } else if (a === '--force') out.force = true;
     else if (a === '--q') out.customQ = argv[++i];
@@ -106,29 +231,30 @@ function parseArgs(argv) {
     else if (a === '--max') out.max = parseInt(argv[++i], 10) || 20;
     else if (a === '--out') out.outPath = argv[++i];
     else if (a === '--pdf') out.pdfIndex = parseInt(argv[++i], 10);
+    else if (a === '--file-only') out.inspectFileOnly = true;
   }
   return out;
 }
 
-function collectPdfAttachments(part, acc) {
-  if (!part) return;
-  const mime = part.mimeType || '';
-  const filename = part.filename || '';
-  if ((mime === 'application/pdf' || /\.pdf$/i.test(filename)) && part.body?.attachmentId) {
-    acc.push({ attachmentId: part.body.attachmentId, filename: filename || 'attachment.pdf' });
-  }
-  if (Array.isArray(part.parts)) {
-    for (const p of part.parts) collectPdfAttachments(p, acc);
-  }
-}
-
 async function listMessages(gmail, q, maxResults) {
-  const res = await gmail.users.messages.list({
-    userId: 'me',
-    q,
-    maxResults
-  });
-  const ids = (res.data.messages || []).map((m) => m.id).filter(Boolean);
+  const cap = Math.min(Math.max(1, maxResults), 500);
+  const ids = [];
+  let pageToken;
+  do {
+    const batch = Math.min(500, cap - ids.length);
+    if (batch <= 0) break;
+    const res = await gmail.users.messages.list({
+      userId: 'me',
+      q,
+      maxResults: batch,
+      pageToken
+    });
+    for (const m of res.data.messages || []) {
+      if (m.id) ids.push(m.id);
+      if (ids.length >= cap) break;
+    }
+    pageToken = ids.length >= cap ? undefined : res.data.nextPageToken;
+  } while (pageToken);
   const rows = [];
   for (const id of ids) {
     const full = await gmail.users.messages.get({
@@ -174,9 +300,16 @@ async function main() {
 
   if (args.cmd === 'list') {
     const day = args.dateStr || yesterdayLocalYmd();
-    const base = 'from:axd365au@hoya.com subject:"Daily Combined Invoice"';
+    const base = args.looseList
+      ? 'from:axd365au@hoya.com'
+      : 'from:axd365au@hoya.com subject:"Daily Combined Invoice"';
     const q = args.customQ || `${base} ${gmailQueryForLocalDay(day)}`;
     console.log('Query:', q);
+    if (args.looseList && !args.customQ) {
+      console.log(
+        '(제목 필터 없음 — Daily Combined 가 아닌 제목의 Hoya 메일도 포함. 파이프라인 run 은 제목·발신 검사 있음.)'
+      );
+    }
     const rows = await listMessages(gmail, q, args.max);
     if (rows.length === 0) {
       console.log('검색 결과 없음. --date 나 --q 로 범위를 넓혀 보세요.');
@@ -229,6 +362,11 @@ async function main() {
           baseUrl.replace(/\/$/, ''),
           '(refresh 는 서버만 보유, 스크립트는 GET /api/internal/xero/access-token 만 호출 — 서버 콘솔에 [xero internal] 로그가 찍혀야 함)'
         );
+        if (tokenBaseIsRemoteHost(baseUrl)) {
+          console.warn(
+            '[Hoya test] 베이스 URL 이 localhost 가 아닙니다. 토큰 요청은 **그 원격 서버**에서 처리되며, 그쪽 배포 환경에도 XERO_INTERNAL_API_KEY(또는 동일 정책)가 있어야 합니다. 이 Mac 의 .env 는 "요청을 보내는 쪽"만 설정합니다.'
+          );
+        }
       } else if (args.useMysql) {
         pool = createMysqlPool();
         initXeroTokenService(pool);
@@ -263,6 +401,15 @@ async function main() {
     }
   }
 
+  if (args.cmd === 'payload') {
+    if (!args.messageId) {
+      usage();
+      process.exit(1);
+    }
+    await dumpGmailMessagePayload(gmail, args.messageId);
+    return;
+  }
+
   if (args.cmd === 'inspect') {
     if (!args.messageId) {
       usage();
@@ -273,8 +420,7 @@ async function main() {
       id: args.messageId,
       format: 'full'
     });
-    const pdfs = [];
-    collectPdfAttachments(full.data.payload, pdfs);
+    const pdfs = collectPdfAttachmentsFromPayload(full.data.payload);
     if (pdfs.length === 0) {
       console.error('PDF 첨부 없음');
       process.exit(1);
@@ -290,10 +436,13 @@ async function main() {
       args.pdfIndex != null
         ? [args.pdfIndex]
         : pdfs.map((_, i) => i);
+    const sniffN = pdfs.filter((p) => p.sniffPdf).length;
     console.log(
-      'PDF 첨부',
+      'PDF·첨부 후보',
       pdfs.length,
-      '개 — inspect:',
+      '개',
+      sniffN > 0 ? `(그중 MIME 불명·시그니처 확인 ${sniffN}개)` : '',
+      '— inspect:',
       indices.length === 1 ? `인덱스 ${indices[0]} 만` : '전부'
     );
 
@@ -303,14 +452,38 @@ async function main() {
       attachments: []
     };
     for (const idx of indices) {
-      const { attachmentId, filename } = pdfs[idx];
-      const att = await gmail.users.messages.attachments.get({
-        userId: 'me',
-        messageId: args.messageId,
-        id: attachmentId
-      });
-      const b64 = att.data.data.replace(/-/g, '+').replace(/_/g, '/');
-      const buffer = Buffer.from(b64, 'base64');
+      const item = pdfs[idx];
+      const filename = item.filename;
+      let buffer;
+      if (item.buffer) {
+        buffer = item.buffer;
+      } else if (item.attachmentId) {
+        const att = await gmail.users.messages.attachments.get({
+          userId: 'me',
+          messageId: args.messageId,
+          id: item.attachmentId
+        });
+        const b64 = att.data.data.replace(/-/g, '+').replace(/_/g, '/');
+        buffer = Buffer.from(b64, 'base64');
+      } else {
+        console.error(`[PDF ${idx}] buffer·attachmentId 없음`);
+        process.exit(1);
+      }
+      if (item.sniffPdf && !bufferLooksLikePdf(buffer)) {
+        console.log(
+          `\n[PDF ${idx}] 스킵 (PDF 시그니처 아님):`,
+          filename,
+          'bytes:',
+          buffer.length
+        );
+        combined.attachments.push({
+          index: idx,
+          filename,
+          byteLength: buffer.length,
+          skippedNotPdf: true
+        });
+        continue;
+      }
       console.log(`\n[PDF ${idx}]`, filename, 'bytes:', buffer.length);
       const report = await inspectHoyaPdfBuffer(buffer);
       combined.attachments.push({
@@ -326,12 +499,17 @@ async function main() {
       }
     }
     const textReport = JSON.stringify(combined, null, 2);
-    console.log('\n--- 전체 JSON (요약 위에 출력됨) ---');
     const defaultOut = path.join(__dirname, '..', 'data', 'hoya-inspect-last.json');
     const outTarget = args.outPath || defaultOut;
     await fs.mkdir(path.dirname(outTarget), { recursive: true });
     await fs.writeFile(outTarget, textReport, 'utf8');
     console.log('저장:', outTarget);
+    if (!args.inspectFileOnly) {
+      console.log('\n--- 전체 JSON (stdout) ---\n');
+      console.log(textReport);
+    } else {
+      console.log('(--file-only: JSON 는 위 경로 파일만 참고)');
+    }
     return;
   }
 }

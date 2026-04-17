@@ -7,7 +7,12 @@
  * → GET {base}/api/internal/xero/access-token (refresh 는 미들웨어·DB 쪽에만 존재)
  *
  * OAuth 앱(XERO_CLIENT_ID / XERO_CLIENT_SECRET)은 하나이고, 법인(엔티티)마다
- * MySQL xero_tokens.id 행·refresh token·tenant 환경 변수는 ENTITY_CONFIG 로 분리합니다.
+ * 테넌트 UUID 는 ENTITY_CONFIG 의 tenantEnv 로 분리합니다.
+ *
+ * 기본: 모든 엔티티가 같은 access — refresh 는 한 법인 행만 사용
+ * (XERO_REFRESH_SOURCE_ENTITY 또는 DEFAULT_ENTITY, 보통 1001 Optical Pty Ltd).
+ * 법인마다 다른 refresh(DB id 2~9)를 쓰려면 XERO_USE_SINGLE_REFRESH_ENTITY=0
+ * Xero 동의에 모든 조직이 포함된 연결이어야 다른 엔티티 tenantId 로 API 호출이 성공합니다.
  */
 import axios from 'axios';
 
@@ -17,52 +22,68 @@ const CACHE_REFRESH_MARGIN_MS = 5 * 60 * 1000;
 /**
  * 법인명 문자열( constants.js 의 branch.entity 와 동일 ) → DB 행 id, 초기 토큰 env, 테넌트 env
  * id 1~9: xero_tokens 테이블 PK와 1:1
+ *
+ * Hoya Bill 공급처 Contact UUID 는 조직마다 다름. .env 예시 (필요한 법인만):
+ *   HOYA_XERO_CONTACT_ID_OPTICAL=…   ← XERO_RT_OPTICAL / XERO_TENANT_ID 와 같은 법인
+ *   HOYA_XERO_CONTACT_ID_INDO=…      ← XERO_RT_INDO / INDO_TENANT_ID
+ * 우선순위는 xeroHoyaBills.resolveSupplierContactId 주석 참고.
+ *
+ * @property {string} [hoyaContactIdEnv] process.env 키 — 법인별 Hoya 공급처 ContactID
  */
 export const ENTITY_CONFIG = {
   '1001 Optical Pty Ltd': {
     id: 1,
     tokenEnv: 'XERO_RT_OPTICAL',
-    tenantEnv: 'XERO_TENANT_ID'
+    tenantEnv: 'XERO_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_OPTICAL'
   },
   '1001 Chatswood Chase Pty Ltd': {
     id: 2,
     tokenEnv: 'XERO_RT_CHASE',
-    tenantEnv: 'CHASE_TENANT_ID'
+    tenantEnv: 'CHASE_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_CHASE'
   },
   'WSQ Eyecare Pty ltd': {
     id: 3,
     tokenEnv: 'XERO_RT_WSQ',
-    tenantEnv: 'WSQ_TENANT_ID'
+    tenantEnv: 'WSQ_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_WSQ'
   },
   'AJ Eyecare Pty Ltd': {
     id: 4,
     tokenEnv: 'XERO_RT_AJ',
-    tenantEnv: 'AJ_TENANT_ID'
+    tenantEnv: 'AJ_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_AJ'
   },
   '1001 Hurstville Pty Ltd': {
     id: 5,
     tokenEnv: 'XERO_RT_HURSTVILLE',
-    tenantEnv: 'HURSTVILLE_TENANT_ID'
+    tenantEnv: 'HURSTVILLE_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_HURSTVILLE'
   },
   'CNC Eyecare Pty Ltd': {
     id: 6,
     tokenEnv: 'XERO_RT_CNC',
-    tenantEnv: 'CNC_TENANT_ID'
+    tenantEnv: 'CNC_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_CNC'
   },
   'SK Eyecare Pty Ltd': {
     id: 7,
     tokenEnv: 'XERO_RT_SK',
-    tenantEnv: 'SK_TENANT_ID'
+    tenantEnv: 'SK_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_SK'
   },
   'JSJ Eyecare Pty Ltd': {
     id: 8,
     tokenEnv: 'XERO_RT_JSJ',
-    tenantEnv: 'JSJ_TENANT_ID'
+    tenantEnv: 'JSJ_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_JSJ'
   },
   '1001 Indooroopilly Pty Ltd': {
     id: 9,
     tokenEnv: 'XERO_RT_INDO',
-    tenantEnv: 'INDO_TENANT_ID'
+    tenantEnv: 'INDO_TENANT_ID',
+    hoyaContactIdEnv: 'HOYA_XERO_CONTACT_ID_INDO'
   }
 };
 
@@ -72,6 +93,39 @@ export const DEFAULT_ENTITY =
 
 /** @deprecated DEFAULT_ENTITY 사용 */
 export const DEFAULT_XERO_ENTITY = DEFAULT_ENTITY;
+
+/**
+ * true: 모든 getAccessToken 이 Optical(앵커) refresh 한 줄로 갱신 — PUT 포함 동일 JWT
+ * false: ENTITY_CONFIG 대로 법인별 refresh (XERO_USE_SINGLE_REFRESH_ENTITY=0)
+ */
+function useSingleSharedXeroRefresh() {
+  const raw = String(process.env.XERO_USE_SINGLE_REFRESH_ENTITY ?? '').trim();
+  if (!raw) return true;
+  return /^(1|true|yes)$/i.test(raw);
+}
+
+/** 공유 refresh 가 저장된 법인명 (ENTITY_CONFIG 키) */
+function sharedRefreshSourceEntityName() {
+  const raw = process.env.XERO_REFRESH_SOURCE_ENTITY?.trim();
+  if (raw && ENTITY_CONFIG[raw]) return raw;
+  return DEFAULT_ENTITY;
+}
+
+/** 내부 HTTP 클라이언트·문서용: access 를 어떤 법인 DB 행으로 갱신할지 (기본 Optical) */
+export function getXeroAccessTokenIssuerEntity() {
+  return sharedRefreshSourceEntityName();
+}
+
+/**
+ * refresh 읽기·저장·access 캐시 키에 쓰는 앵커 법인.
+ * 단일 refresh 모드면 소스 법인 하나로 통일, 아니면 요청한 법인 그대로.
+ */
+function tokenAnchorEntity(requestedEntityName) {
+  /** 원격 미들웨어만 쓰는 CLI/워커: 항상 issuer 한 줄로 받은 access 를 법인 간 공유 캐시 */
+  if (usesInternalHttpAccessToken()) return sharedRefreshSourceEntityName();
+  if (useSingleSharedXeroRefresh()) return sharedRefreshSourceEntityName();
+  return String(requestedEntityName);
+}
 
 /** @type {import('mysql2/promise').Pool | null} */
 let poolRef = null;
@@ -202,11 +256,11 @@ export async function ensureXeroTokensReady() {
  */
 export async function getStoredRefreshTokenForEntity(entityName) {
   await ensureXeroTokensReady();
-  const cfg = resolveEntityConfig(entityName);
-  const key = String(entityName);
+  const anchor = tokenAnchorEntity(entityName);
+  const cfg = resolveEntityConfig(anchor);
   if (tokenPersistenceEnvOnly || !poolRef) {
-    if (memoryRefreshTokens.has(key)) {
-      const m = memoryRefreshTokens.get(key);
+    if (memoryRefreshTokens.has(anchor)) {
+      const m = memoryRefreshTokens.get(anchor);
       if (m && String(m).trim()) return String(m).trim();
     }
     const fromEnv = process.env[cfg.tokenEnv];
@@ -229,12 +283,12 @@ export async function getStoredRefreshTokenForEntity(entityName) {
  */
 async function saveRefreshTokenForEntity(entityName, refreshToken) {
   await ensureXeroTokensReady();
-  const key = String(entityName);
+  const anchor = tokenAnchorEntity(entityName);
   if (tokenPersistenceEnvOnly || !poolRef) {
-    memoryRefreshTokens.set(key, refreshToken);
+    memoryRefreshTokens.set(anchor, refreshToken);
     return;
   }
-  const cfg = resolveEntityConfig(entityName);
+  const cfg = resolveEntityConfig(anchor);
   const [r] = await poolRef.query(
     'UPDATE xero_tokens SET refresh_token = ? WHERE id = ?',
     [refreshToken, cfg.id]
@@ -256,7 +310,7 @@ function cacheValid(entry) {
  * @param {string} entityName
  */
 export function getAccessTokenRemainingSeconds(entityName) {
-  const key = String(entityName);
+  const key = tokenAnchorEntity(entityName);
   const entry = tokenCache.get(key);
   if (!entry || !cacheValid(entry)) return 0;
   return Math.max(0, Math.floor((entry.expiresAtMs - Date.now()) / 1000));
@@ -274,10 +328,11 @@ async function fetchAccessTokenFromInternalHttp(entityName) {
     );
   }
   const url = `${base}/api/internal/xero/access-token`;
+  const issuer = getXeroAccessTokenIssuerEntity();
   let res;
   try {
     res = await axios.get(url, {
-      params: { entity: entityName },
+      params: { entity: entityName, accessEntity: issuer },
       headers: { Authorization: `Bearer ${apiKey}` },
       validateStatus: () => true
     });
@@ -310,16 +365,16 @@ async function fetchAccessTokenFromInternalHttp(entityName) {
         : `내부 access-token API 실패 (HTTP ${res.status})${hint503}`
     );
   }
-  const key = String(entityName);
+  const reqKey = String(entityName);
   if (data.tenantId && String(data.tenantId).trim()) {
-    tenantIdFromInternalApi.set(key, String(data.tenantId).trim());
+    tenantIdFromInternalApi.set(reqKey, String(data.tenantId).trim());
   }
   const expiresInSec = Number(data.expiresIn) || 0;
   const expiresAtMs =
     expiresInSec > 0
       ? Date.now() + expiresInSec * 1000
       : Date.now() + 25 * 60 * 1000;
-  tokenCache.set(key, { accessToken: data.accessToken, expiresAtMs });
+  tokenCache.set(tokenAnchorEntity(entityName), { accessToken: data.accessToken, expiresAtMs });
   return data.accessToken;
 }
 
@@ -334,11 +389,13 @@ async function refreshAccessTokenInternal(entityName) {
   }
 
   const refreshToken = await getStoredRefreshTokenForEntity(entityName);
+  const cacheKey = tokenAnchorEntity(entityName);
   if (!refreshToken) {
-    const cfg = resolveEntityConfig(entityName);
-    throw new Error(
-      `법인 "${entityName}"의 Refresh Token이 없습니다. MySQL xero_tokens.id=${cfg.id} 또는 환경 변수 ${cfg.tokenEnv} 를 설정하세요.`
-    );
+    const cfg = resolveEntityConfig(cacheKey);
+    const hint = useSingleSharedXeroRefresh()
+      ? `공유 Refresh 법인 "${cacheKey}" — MySQL xero_tokens.id=${cfg.id} 또는 ${cfg.tokenEnv}`
+      : `법인 "${entityName}"의 Refresh Token이 없습니다. MySQL xero_tokens.id=${cfg.id} 또는 환경 변수 ${cfg.tokenEnv}`;
+    throw new Error(`${hint} 를 설정하세요.`);
   }
 
   let data;
@@ -349,20 +406,20 @@ async function refreshAccessTokenInternal(entityName) {
       process.env.XERO_CLIENT_SECRET
     );
   } catch (err) {
-    tokenCache.delete(String(entityName));
+    tokenCache.delete(cacheKey);
     console.error('토큰 갱신 실패:', err.response?.status, err.response?.data || err.message);
     throw err;
   }
 
   const accessToken = data.access_token;
   if (!accessToken) {
-    tokenCache.delete(String(entityName));
+    tokenCache.delete(cacheKey);
     throw new Error('Access Token이 응답에 포함되지 않았습니다.');
   }
 
   const expiresInSec = Number(data.expires_in) || 1800;
   const expiresAtMs = Date.now() + expiresInSec * 1000;
-  tokenCache.set(String(entityName), { accessToken, expiresAtMs });
+  tokenCache.set(cacheKey, { accessToken, expiresAtMs });
 
   const newRt = data.refresh_token;
   if (newRt && newRt !== refreshToken) {
@@ -381,24 +438,34 @@ export async function getAccessToken(entityName = DEFAULT_ENTITY) {
   resolveEntityConfig(key);
   await ensureXeroTokensReady();
 
-  const cached = tokenCache.get(key);
-  if (cacheValid(cached)) {
-    return cached.accessToken;
+  const cacheKey = tokenAnchorEntity(key);
+
+  /** Postman 과 비교 시: 캐시 때문에 예전 access 가 나갈 수 있음 — `XERO_SKIP_ACCESS_TOKEN_CACHE=1` 이면 매번 갱신 경로 */
+  const skipCache = /^(1|true|yes)$/i.test(
+    String(process.env.XERO_SKIP_ACCESS_TOKEN_CACHE || '')
+  );
+  if (skipCache) {
+    tokenCache.delete(cacheKey);
+  } else {
+    const cached = tokenCache.get(cacheKey);
+    if (cacheValid(cached)) {
+      return cached.accessToken;
+    }
   }
 
-  if (refreshInFlight.has(key)) {
-    return refreshInFlight.get(key);
+  if (refreshInFlight.has(cacheKey)) {
+    return refreshInFlight.get(cacheKey);
   }
 
   const p = refreshAccessTokenInternal(key)
     .catch((err) => {
-      tokenCache.delete(key);
+      tokenCache.delete(cacheKey);
       throw err;
     })
     .finally(() => {
-      refreshInFlight.delete(key);
+      refreshInFlight.delete(cacheKey);
     });
 
-  refreshInFlight.set(key, p);
+  refreshInFlight.set(cacheKey, p);
   return p;
 }

@@ -47,8 +47,13 @@ xeroInternalRouter.get('/access-token', async (req, res) => {
 
   const raw = req.query.entity != null ? String(req.query.entity).trim() : '';
   const entity = raw || DEFAULT_ENTITY;
+  const rawAccessEntity =
+    req.query.accessEntity != null ? String(req.query.accessEntity).trim() : '';
 
-  console.log('[xero internal] GET /access-token 요청', { entity });
+  console.log('[xero internal] GET /access-token 요청', {
+    entity,
+    accessEntity: rawAccessEntity || '(same as entity)'
+  });
 
   try {
     resolveEntityConfig(entity);
@@ -60,9 +65,23 @@ xeroInternalRouter.get('/access-token', async (req, res) => {
     });
   }
 
+  let tokenEntity = entity;
+  if (rawAccessEntity) {
+    try {
+      resolveEntityConfig(rawAccessEntity);
+      tokenEntity = rawAccessEntity;
+    } catch (e) {
+      return res.status(400).json({
+        success: false,
+        error: `accessEntity: ${e.message || 'Unknown entity'}`,
+        knownEntities: Object.keys(ENTITY_CONFIG)
+      });
+    }
+  }
+
   try {
-    const accessToken = await getAccessToken(entity);
-    const expiresIn = getAccessTokenRemainingSeconds(entity);
+    const accessToken = await getAccessToken(tokenEntity);
+    const expiresIn = getAccessTokenRemainingSeconds(tokenEntity);
     const tenantId = getTenantIdForEntity(entity);
     if (!tenantId) {
       const cfg = ENTITY_CONFIG[entity];
@@ -72,7 +91,7 @@ xeroInternalRouter.get('/access-token', async (req, res) => {
         error: `Tenant ID 환경 변수 ${cfg.tenantEnv} 가 비어 있습니다.`
       });
     }
-    console.log('[xero internal] access-token 발급 OK', { entity });
+    console.log('[xero internal] access-token 발급 OK', { entity, tokenEntity });
     return res.json({
       success: true,
       accessToken,
@@ -82,7 +101,7 @@ xeroInternalRouter.get('/access-token', async (req, res) => {
     });
   } catch (error) {
     const msg = error.message || 'Token refresh failed';
-    console.error('[xero internal] access-token 실패', { entity, error: msg });
+    console.error('[xero internal] access-token 실패', { entity, tokenEntity, error: msg });
     return res.status(500).json({
       success: false,
       error: msg

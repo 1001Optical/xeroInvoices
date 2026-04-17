@@ -83,6 +83,8 @@ export function extractReferenceHintFromAttachmentName(fileName) {
   if (m1?.[1]) return m1[1].trim();
   const m2 = base.match(/\b(IN\d{4,})\b/i);
   if (m2?.[1]) return m2[1].trim();
+  const m3 = base.match(/\b(FCN[A-Z0-9]+)\b/i);
+  if (m3?.[1]) return m3[1].trim();
   return null;
 }
 
@@ -155,6 +157,7 @@ export async function parseHoyaCombinedPdf(buffer, options = {}) {
           soldTo: null,
           storeLine: null,
           lineItems: [],
+          documentKind: 'supplier_invoice',
           fieldParseFailed: true
         });
         continue;
@@ -179,25 +182,80 @@ export async function parseHoyaCombinedPdf(buffer, options = {}) {
  * @param {string} secondary 읽기 순서
  * @param {string} [tertiary] join(공백) — 라벨·값이 한 줄로 이어질 때
  */
+function countMeaningfulLineItems(items) {
+  if (!items?.length) return 0;
+  return items.filter((li) => {
+    const d = (li?.description || '').trim();
+    const q = parseFloat(String(li?.qty ?? '').replace(/,/g, ''));
+    const p = parseFloat(String(li?.price ?? '').replace(/,/g, ''));
+    const amt = parseFloat(String(li?.amount ?? '').replace(/,/g, ''));
+    const hasNum =
+      (Number.isFinite(q) && q !== 0) ||
+      (Number.isFinite(p) && p !== 0) ||
+      (Number.isFinite(amt) && amt !== 0);
+    return !!(d || hasNum);
+  }).length;
+}
+
+function storeMetaQuality(x) {
+  const sl = String(x?.storeLine || '').trim();
+  const st = String(x?.soldTo || '');
+  if (/\b1001\s+OPTICAL\s+CENTRAL\s+DISTRIBUTION\b/i.test(sl)) return 4;
+  if (/\b1001\s+OPTICAL\s+CENTRAL\s+DISTRIBUTION\b/i.test(st)) return 4;
+  if (/^\s*account\b/im.test(st) && !/\b1001\b/i.test(st)) return 0;
+  if (sl.toLowerCase() === 'account') return 0;
+  if (/\bdelivery\s+note\s+no\.?/i.test(st) && !/\b1001\s+OPTICAL\b/i.test(st)) return 0;
+  return sl || st ? 1 : 0;
+}
+
 function mergeHoyaParseAttempts(primary, secondary, tertiary) {
   const a = parseHoyaInvoicePageText(normalizeExtractText(primary));
   const b = parseHoyaInvoicePageText(normalizeExtractText(secondary));
   const c = tertiary
     ? parseHoyaInvoicePageText(normalizeExtractText(tertiary))
-    : { lineItems: [] };
-  const lineItems = a.lineItems?.length
-    ? a.lineItems
-    : b.lineItems?.length
-      ? b.lineItems
-      : c.lineItems?.length
-        ? c.lineItems
-        : [];
+    : {
+        lineItems: [],
+        soldTo: null,
+        storeLine: null,
+        documentKind: 'supplier_invoice'
+      };
+
+  const attempts = [a, b, c];
+  let bestItems = [];
+  let bestLiScore = -1;
+  for (const x of attempts) {
+    const s = countMeaningfulLineItems(x.lineItems);
+    if (s > bestLiScore) {
+      bestLiScore = s;
+      bestItems = x.lineItems || [];
+    }
+  }
+  if (bestLiScore <= 0) {
+    bestItems = a.lineItems?.length
+      ? a.lineItems
+      : b.lineItems?.length
+        ? b.lineItems
+        : c.lineItems || [];
+  }
+
+  const metaPick = attempts.reduce((best, x) =>
+    storeMetaQuality(x) > storeMetaQuality(best) ? x : best
+  );
+
+  const documentKind =
+    a.documentKind === 'supplier_credit_note' ||
+    b.documentKind === 'supplier_credit_note' ||
+    c.documentKind === 'supplier_credit_note'
+      ? 'supplier_credit_note'
+      : 'supplier_invoice';
+
   return {
     referenceNumber: a.referenceNumber || b.referenceNumber || c.referenceNumber,
     invoiceDate: a.invoiceDate || b.invoiceDate || c.invoiceDate,
-    soldTo: a.soldTo || b.soldTo || c.soldTo,
-    storeLine: a.storeLine || b.storeLine || c.storeLine,
-    lineItems
+    soldTo: metaPick.soldTo || a.soldTo || b.soldTo || c.soldTo,
+    storeLine: metaPick.storeLine || a.storeLine || b.storeLine || c.storeLine,
+    lineItems: bestItems,
+    documentKind
   };
 }
 
@@ -211,25 +269,144 @@ function squeezeText(text) {
  * @param {string} normalized 줄바꿈 유지
  * @param {string} flat 한 줄
  */
-function extractReferenceNumber(normalized, flat) {
+/**
+ * TAX INVOICE 다음 몇 줄 안의 INxxxxxxxx (PDF에서 제목과 번호가 줄이 갈라질 때)
+ * TAX / INVOICE 가 서로 다른 줄에만 있는 경우도 포함
+ */
+function extractReferenceAfterTaxInvoice(normalized) {
+  const m = normalized.match(/\bTAX(?:\s+|\s*[\r\n]+\s*)INVOICE\b/i);
+  if (!m || m.index == null) return null;
+  const tail = normalized.slice(m.index + m[0].length);
+  const lines = tail
+    .split(/\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  for (const line of lines.slice(0, 8)) {
+    if (/^INVOICE\s*(?:NUMBER|NO\.?)/i.test(line)) continue;
+    const im = line.match(/^(IN\d{4,})\b/i);
+    if (im?.[1]) return im[1].trim();
+    const im2 = line.match(/\b(IN\d{5,})\b/i);
+    if (im2?.[1]) return im2[1].trim();
+  }
+  return null;
+}
+
+/** 본문에서 크레딧 문서 구분 — 공백 없는 CREDITNOTE 도 허용 */
+const HOYA_CREDIT_NOTE_MARK = /\bCREDIT\s*NOTE\b/i;
+
+const SKIP_CREDIT_REF_LINE =
+  /^(CREDIT\s*NOTE(\s+(DATE|NUMBER))?|HOYA\b|ABN\b|MAIL\s+TO:|TEL\.|FAX\(|UNIT\s+\d)/i;
+
+/**
+ * CREDIT NOTE NUMBER 라벨 뒤에서 문서번호 추출 (FCN/CN 등 접두에 의존하지 않음)
+ */
+function filterCreditNoteDocumentNumber(raw) {
+  const v = filterBogusReference(String(raw).replace(/^[*]+|[*]+$/g, '').trim());
+  if (!v) return null;
+  if (/^0+$/.test(v)) return null;
+  /** 짧은 순수 숫자(배치·연도)는 문서번호로 쓰지 않음 */
+  if (/^\d+$/.test(v) && v.length < 8) return null;
+  if (/^(19|20)\d{2}$/.test(v)) return null;
+  const lower = v.toLowerCase();
+  if (
+    lower === 'credit' ||
+    lower === 'note' ||
+    lower === 'number' ||
+    lower === 'date' ||
+    /^credit\s*note$/i.test(v)
+  ) {
+    return null;
+  }
+  return v;
+}
+
+function extractHoyaSupplierCreditNoteNumber(normalized, flat) {
+  if (!HOYA_CREDIT_NOTE_MARK.test(normalized)) return null;
   const candidates = [normalized, flat, squeezeText(normalized)];
-  /** 라벨만 있고 값이 아래쪽(TAX INVOICE 다음)에 있는 Hoya 레이아웃 */
+  for (const hay of candidates) {
+    const m = hay.match(/\bCREDIT\s*NOTE\s+NUMBER\b/i);
+    if (!m || m.index == null) continue;
+    const tail = hay.slice(m.index + m[0].length);
+    const lines = tail.split(/\n/).map((l) => l.trim());
+    for (const line of lines.slice(0, 24)) {
+      if (!line || SKIP_CREDIT_REF_LINE.test(line)) continue;
+      const tokens = line.split(/\s+/);
+      for (const tok of tokens) {
+        const t = tok.replace(/^[*]+|[*]+$/g, '');
+        if (/^[A-Z0-9][A-Z0-9_-]{3,}$/i.test(t)) {
+          const ok = filterCreditNoteDocumentNumber(t);
+          if (ok) return ok;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+const BOGUS_REFERENCE_TOKENS = new Set([
+  'quantity',
+  'description',
+  'amount',
+  'patient',
+  'delivery',
+  'reference',
+  'account',
+  'total',
+  'number',
+  'date',
+  'invoice',
+  'invoices',
+  'tax',
+  'note',
+  'credit'
+]);
+
+function filterBogusReference(ref) {
+  if (ref == null || ref === '') return null;
+  const s = String(ref).trim();
+  if (!s) return null;
+  const lower = s.toLowerCase();
+  if (BOGUS_REFERENCE_TOKENS.has(lower)) return null;
+  /** TAX INVOICE 옆 토큰으로 잡힌 라벨 (IN + … 패턴 오탐) */
+  if (/^in\s*voices?$/i.test(s)) return null;
+  /**
+   * IN으로 시작하지만 숫자가 없음 → "INVOICE" 등 (\bIN[A-Z0-9]…\b 오탐 방지).
+   * Hoya 공급 인보이스 번호는 IN + 숫자(또는 FCN…) 형태가 대부분.
+   */
+  if (/^IN[A-Z0-9_-]+$/i.test(s) && !/\d/.test(s)) return null;
+  return s;
+}
+
+function extractReferenceNumber(normalized, flat) {
+  const creditRef = extractHoyaSupplierCreditNoteNumber(normalized, flat);
+  if (creditRef) return creditRef;
+
+  const candidates = [normalized, flat, squeezeText(normalized)];
+  /** 같은 줄 / 다음 줄 — Hoya TAX INVOICE 블록 (ORIGINAL INVOICE NUMBER 는 제외) */
+  /** IN… 는 숫자 포함 필수 — 단어 INVOICE 가 IN+V+… 로 잡히는 것 방지 */
+  const inWithDigit = 'IN(?=[A-Z0-9_-]*\\d)[A-Z0-9][A-Z0-9_-]*';
   const refPatterns = [
-    /TAX\s+INVOICE\s+(IN[A-Z0-9][A-Z0-9_-]*)/i,
-    /INVOICE\s*(?:NUMBER|NO\.?)\s*:?\s*(IN[A-Z0-9][A-Z0-9_-]*)/i,
-    /INVOICE\s*(?:NUMBER|NO\.?)\s*:?\s*([A-Z]{1,6}\d[A-Z0-9_-]*)/i,
-    /INVOICE\s*(?:NUMBER|NO\.?)\s*:?\s*(\d{5,12})/,
-    /Invoice\s*(?:Number|No\.?)\s*:?\s*([A-Z0-9][A-Z0-9_-]{3,})/i,
+    new RegExp(`TAX\\s+INVOICE\\s+(${inWithDigit})`, 'i'),
+    new RegExp(`TAX\\s+INVOICE\\s*[\\r\\n]+\\s*(${inWithDigit})`, 'im'),
+    /TAX\s+INVOICE\s*[\s\n]+\b(IN\d{5,})\b/i,
+    /(?<!\bORIGINAL\s)INVOICE\s*(?:NUMBER|NO\.?)\s*:?\s*(IN[A-Z0-9][A-Z0-9_-]*)/i,
+    /(?<!\bORIGINAL\s)INVOICE\s*(?:NUMBER|NO\.?)\s*:?\s*([A-Z]{1,6}\d[A-Z0-9_-]*)/i,
+    /(?<!\bORIGINAL\s)INVOICE\s*(?:NUMBER|NO\.?)\s*:?\s*(\d{5,12})/,
+    /(?<!\bORIGINAL\s)Invoice\s*(?:Number|No\.?)\s*:?\s*([A-Z0-9][A-Z0-9_-]{3,})/i,
     /\b(IN\d{4,})\b/i,
     /\b(INV[A-Z0-9][A-Z0-9_-]{2,})\b/i
   ];
   for (const hay of candidates) {
     for (const re of refPatterns) {
       const m = hay.match(re);
-      if (m?.[1]) return m[1].trim();
+      if (m?.[1]) {
+        const v = filterBogusReference(m[1].trim());
+        if (v) return v;
+      }
     }
   }
-  return null;
+  const tailRef = extractReferenceAfterTaxInvoice(normalized);
+  return filterBogusReference(tailRef);
 }
 
 /**
@@ -240,6 +417,7 @@ function extractInvoiceDate(normalized, flat) {
   const candidates = [normalized, flat, squeezeText(normalized)];
   /** DD MMM YYYY (예: 15 Apr 2026) — 라벨 INVOICE DATE 와 값이 떨어진 Hoya */
   const datePatterns = [
+    /CREDIT\s*NOTE\s+DATE\s*[\s:]*(?:[\r\n]+\s*)*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})/i,
     /INVOICE\s*DATE\s*:?\s*([0-9]{1,2}\s+[A-Za-z]{3,9}\s+[0-9]{4})/i,
     /\b([0-9]{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+[0-9]{4})\b/i,
     /INVOICE\s*DATE\s*:?\s*([0-9]{1,2}\s*[/\-.]\s*[0-9]{1,2}\s*[/\-.]\s*[0-9]{2,4})/i,
@@ -283,10 +461,15 @@ export function parseHoyaInvoicePageText(text) {
 
   let soldTo = null;
   let storeLine = null;
+  const tableStartAhead =
+    '(?=PRODUCT\\s*DESCRIPTION|\\n\\s*Description\\b|INVOICE\\s*(?:NUMBER|DATE)|$)';
   const soldPatterns = [
-    /SOLD\s*TO\s*([\s\S]*?)(?=PRODUCT\s*DESCRIPTION|INVOICE\s*(?:NUMBER|DATE)|$)/i,
-    /SHIP\s*TO\s*([\s\S]*?)(?=PRODUCT\s*DESCRIPTION|INVOICE\s*(?:NUMBER|DATE)|$)/i,
-    /CUSTOMER\s*([\s\S]*?)(?=PRODUCT\s*DESCRIPTION|INVOICE\s*(?:NUMBER|DATE)|$)/i
+    new RegExp(`SOLD\\s*TO\\s*([\\s\\S]*?)${tableStartAhead}`, 'i'),
+    new RegExp(
+      `SHIP\\s*TO\\s+(?!Account\\b)([\\s\\S]*?)${tableStartAhead}`,
+      'i'
+    ),
+    new RegExp(`CUSTOMER\\s*([\\s\\S]*?)${tableStartAhead}`, 'i')
   ];
   for (const re of soldPatterns) {
     const soldBlock = normalized.match(re);
@@ -298,20 +481,207 @@ export function parseHoyaInvoicePageText(text) {
     }
   }
 
-  const lineItems = extractProductLineItems(normalized);
+  /**
+   * Hoya: Central 주소 블록 — SOLD TO 정규식이 세로 레이아웃·표 헤더(Account…)만 잡은 경우 덮어씀
+   */
+  const hasCentral = /\b1001\s+OPTICAL\s+CENTRAL\s+DISTRIBUTION\b/i.test(normalized);
+  const centralLooksWrong =
+    !soldTo ||
+    /^\s*account\b/im.test(String(soldTo)) ||
+    String(storeLine || '')
+      .trim()
+      .toLowerCase() === 'account' ||
+    (/\bdelivery\s+note\s+no\.?/i.test(String(soldTo)) &&
+      !/\b1001\s+OPTICAL\b/i.test(String(soldTo)));
+  if (hasCentral && centralLooksWrong) {
+    const anchor = /\b1001\s+OPTICAL\s+CENTRAL\s+DISTRIBUTION\b/i;
+    const am = normalized.match(anchor);
+    if (am?.index != null) {
+      const tail = normalized.slice(am.index);
+      const stopPd = tail.search(/\n\s*PRODUCT\s*DESCRIPTION\b/i);
+      const stopDesc = tail.search(
+        /\n\s*Description\b[\s\S]{0,120}?\bQ(?:ty|TY)\b[\s\S]{0,80}?\bPRICE\b/i
+      );
+      const stopCands = [stopPd, stopDesc].filter((i) => i >= 0);
+      const stopIdx = stopCands.length ? Math.min(...stopCands) : -1;
+      const slice =
+        stopIdx >= 0 ? tail.slice(0, stopIdx) : tail.slice(0, Math.min(tail.length, 800));
+      soldTo = slice.trim().replace(/\n{3,}/g, '\n\n');
+      const lines = soldTo.split('\n').map((l) => l.trim()).filter(Boolean);
+      storeLine = lines.find((l) => /1001/i.test(l)) || lines[0] || null;
+    }
+  }
+
+  let lineItems = extractProductLineItems(normalized);
+  const isCredit = HOYA_CREDIT_NOTE_MARK.test(normalized);
+  if (isCredit) {
+    const cn = extractCreditNoteLineItems(normalized);
+    if (cn.length > 0) lineItems = cn;
+  }
+
+  const documentKind = isCredit ? 'supplier_credit_note' : 'supplier_invoice';
 
   return {
     referenceNumber,
     invoiceDate,
     soldTo,
     storeLine,
-    lineItems
+    lineItems,
+    documentKind
   };
 }
 
 /**
  * QTY 헤더 이후 표 형태: 한 줄에 수량·단가·GST·금액 4열 (PDF 텍스트가 한 줄로 나올 때)
  */
+/** 표 헤더 한 줄 (QTY PRICE GST …) */
+const HOYA_TABLE_HEADER_LINE = /\bQTY\b.*\bPRICE\b.*\bGST\b/i;
+
+/**
+ * 한 줄 끝에 Qty·Unit·GST·Amount 네 숫자가 붙는 Hoya 형식
+ * 예: OT-PZGR-1.50 HARD / R SPH 0.00 1 20.00 2.00 22.00
+ */
+function parseHoyaLensRowsTrailingFourNumbers(block) {
+  const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+  const out = [];
+  let baseProduct = '';
+
+  for (const line of lines) {
+    if (/^product\s*description/i.test(line)) continue;
+    if (HOYA_TABLE_HEADER_LINE.test(line)) continue;
+    if (/^\s*sales\s+order\s+no\.?/i.test(line)) break;
+    if (/^\*[\d,*]+\*$/.test(line.replace(/\s/g, ''))) continue;
+
+    const tokens = line.split(/\s+/);
+    if (tokens.length < 5) {
+      if (/[A-Za-z]/.test(line) && !/^[\d\s,.-]+$/.test(line)) {
+        baseProduct = line.replace(/\s+/g, ' ').trim();
+      }
+      continue;
+    }
+
+    const tail = [];
+    let idx = tokens.length - 1;
+    while (idx >= 0 && tail.length < 4) {
+      const raw = String(tokens[idx]).replace(/,/g, '');
+      if (/^-?\d+\.?\d*$/.test(raw)) {
+        tail.unshift(raw);
+        idx--;
+      } else break;
+    }
+    if (tail.length < 4) {
+      if (/[A-Za-z]/.test(line) && tokens.length <= 8) {
+        baseProduct = line.replace(/\s+/g, ' ').trim();
+      }
+      continue;
+    }
+
+    const specTokens = tokens.slice(0, tokens.length - 4);
+    const spec = specTokens.join(' ').trim();
+    if (!spec) continue;
+
+    const desc = [baseProduct, spec].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
+    out.push({
+      description: desc,
+      qty: tail[0],
+      price: tail[1],
+      gst: tail[2],
+      amount: tail[3]
+    });
+  }
+  return out;
+}
+
+/**
+ * 제품/렌즈 코드 줄 다음에 qty·price·gst·amount (한 줄 네 숫자 또는 PDF에서 네 줄로 쪼개진 경우)
+ * 예: OT-SVF-1.50 MC / 1 1.25 0.00 1.25  또는  OT… 후 줄바꿈 1 / 1.96 / 0.00 / 1.96
+ */
+function parseHoyaProductNumericPairRows(block) {
+  const lines = block.split(/\n/).map((l) => l.trim()).filter(Boolean);
+  const out = [];
+  let pendingDesc = null;
+  let numBuffer = [];
+
+  const flushBufferedQuad = () => {
+    if (pendingDesc && numBuffer.length === 4) {
+      out.push({
+        description: pendingDesc.replace(/\s+/g, ' ').trim().slice(0, 2000),
+        qty: numBuffer[0],
+        price: numBuffer[1],
+        gst: numBuffer[2],
+        amount: numBuffer[3]
+      });
+      pendingDesc = null;
+    }
+    numBuffer = [];
+  };
+
+  for (const line of lines) {
+    if (/^product\s*description/i.test(line)) continue;
+    if (HOYA_TABLE_HEADER_LINE.test(line)) {
+      flushBufferedQuad();
+      pendingDesc = null;
+      numBuffer = [];
+      continue;
+    }
+    if (/^\s*sales\s+order\s+no\.?/i.test(line)) break;
+
+    const tokens = line.split(/\s+/);
+    const isQuad =
+      tokens.length === 4 &&
+      tokens.every((t) => /^-?\d+\.?\d*$/.test(String(t).replace(/,/g, '')));
+
+    if (isQuad) {
+      const descForRow = pendingDesc;
+      flushBufferedQuad();
+      out.push({
+        description: (descForRow || '').replace(/\s+/g, ' ').trim().slice(0, 2000),
+        qty: String(tokens[0]).replace(/,/g, ''),
+        price: String(tokens[1]).replace(/,/g, ''),
+        gst: String(tokens[2]).replace(/,/g, ''),
+        amount: String(tokens[3]).replace(/,/g, '')
+      });
+      pendingDesc = null;
+      numBuffer = [];
+      continue;
+    }
+
+    const allTokNumeric =
+      tokens.length >= 1 &&
+      tokens.every((t) => /^-?\d+\.?\d*$/.test(String(t).replace(/,/g, '')));
+
+    if (allTokNumeric && pendingDesc) {
+      if (tokens.length === 1) {
+        numBuffer.push(String(tokens[0]).replace(/,/g, ''));
+        if (numBuffer.length === 4) {
+          flushBufferedQuad();
+        }
+        continue;
+      }
+      numBuffer = [];
+      continue;
+    }
+
+    flushBufferedQuad();
+    numBuffer = [];
+
+    if (/^\*[\d,*]+\*$/.test(line.replace(/\s/g, ''))) continue;
+    if (/^\d{5,}\s+\d{3,}\s+/i.test(line)) {
+      pendingDesc = null;
+      continue;
+    }
+
+    if (/[A-Za-z]/.test(line) && line.length >= 2) {
+      pendingDesc = line.replace(/\s+/g, ' ').trim();
+    } else {
+      pendingDesc = null;
+    }
+  }
+
+  flushBufferedQuad();
+  return out.filter((r) => r.qty && r.price);
+}
+
 function parseNumericRowsFromTableText(tableText) {
   const rows = [];
   for (const line of tableText.split('\n')) {
@@ -342,6 +712,7 @@ function isNumericTokenLine(line) {
 /** 처방·도수 줄: SPH… / (CYL+AXIS 조합 등) 렌즈 스펙 */
 function isLensSpecLine(line) {
   const t = String(line).trim();
+  if (/^[RL]\s+SPH\b/i.test(t)) return true;
   if (/^SPH\s/i.test(t)) return true;
   if (/^PL\s/i.test(t)) return true;
   if (/\bSPH\s*\+?-?[\d.]/.test(t) && /\bCYL\b/i.test(t)) return true;
@@ -429,6 +800,113 @@ function parseVerticalHoyaLensBlock(block) {
   return items;
 }
 
+function normalizeCreditNumericToken(raw) {
+  const t = String(raw).trim().replace(/,/g, '');
+  const p = t.match(/^\(([-\d.]+)\)$/);
+  if (p) return String(-Math.abs(parseFloat(p[1])));
+  return t;
+}
+
+function isCreditNoteAmountLine(line) {
+  const t = String(line).trim().replace(/,/g, '');
+  if (t === '' || t === '-') return false;
+  if (/^-?\d+\.?\d*$/.test(t)) return true;
+  return /^\(-?[\d.]+\)$/.test(t);
+}
+
+/**
+ * Hoya 공급자 크레딧 노트: Description / Qty / PRICE / GST / Amount 표 (PRODUCT DESCRIPTION 없음)
+ */
+function extractCreditNoteLineItems(normalized) {
+  const items = [];
+  const dm = normalized.match(/\bDescription\b/i);
+  if (!dm || dm.index == null) return items;
+
+  let tail = normalized.slice(dm.index);
+  const endIdx = tail.search(/\bSRN\s+NUMBER\b/i);
+  if (endIdx > 0) tail = tail.slice(0, endIdx);
+
+  const headProbe = tail.slice(0, 500);
+  if (!/\bQ(?:ty|TY)\b/i.test(headProbe) || !/\bPRICE\b/i.test(headProbe)) return items;
+
+  const lines = tail.split(/\n/).map((l) => l.trim());
+  let i = 0;
+  while (i < lines.length) {
+    if (/^amount$/i.test(lines[i])) {
+      i++;
+      break;
+    }
+    i++;
+  }
+
+  let descParts = [];
+  let numBuffer = [];
+
+  const flushRow = () => {
+    if (numBuffer.length === 4 && descParts.length > 0) {
+      const description = descParts.join(' ').replace(/\s+/g, ' ').trim().slice(0, 2000);
+      if (description && !/^amount$/i.test(description)) {
+        items.push({
+          description,
+          qty: numBuffer[0],
+          price: numBuffer[1],
+          gst: numBuffer[2],
+          amount: numBuffer[3]
+        });
+      }
+    }
+    descParts = [];
+    numBuffer = [];
+  };
+
+  for (; i < lines.length; i++) {
+    const line = lines[i];
+    if (!line) continue;
+    if (/^the title of\b/i.test(line)) break;
+    if (/^payment\s+terms\b/i.test(line)) break;
+    if (/^quantity$/i.test(line) && /total/i.test(String(lines[i + 1] || '').toLowerCase())) break;
+
+    const oneLineQuad = line.match(
+      /^(.+?)\s+(-?[\d.]+|\([\d.]+\))\s+(-?[\d.]+|\([\d.]+\))\s+(-?[\d.]+|\([\d.]+\))\s+(-?[\d.]+|\([\d.]+\))\s*$/
+    );
+    if (oneLineQuad && /[A-Za-z]{2,}/.test(oneLineQuad[1])) {
+      flushRow();
+      const d = oneLineQuad[1].trim();
+      if (!/^(Qty|QTY|PRICE|GST|Amount|Description)$/i.test(d)) {
+        items.push({
+          description: d.slice(0, 2000),
+          qty: normalizeCreditNumericToken(oneLineQuad[2]),
+          price: normalizeCreditNumericToken(oneLineQuad[3]),
+          gst: normalizeCreditNumericToken(oneLineQuad[4]),
+          amount: normalizeCreditNumericToken(oneLineQuad[5])
+        });
+      }
+      continue;
+    }
+
+    if (isCreditNoteAmountLine(line)) {
+      if (descParts.length === 0 && numBuffer.length === 0) continue;
+      numBuffer.push(normalizeCreditNumericToken(line));
+      if (numBuffer.length === 4) {
+        flushRow();
+      }
+      continue;
+    }
+
+    if (numBuffer.length > 0) {
+      numBuffer = [];
+    }
+    if (/^qty$/i.test(line) || /^price$/i.test(line) || /^gst$/i.test(line) || /^amount$/i.test(line))
+      continue;
+    if (/[A-Za-z]/.test(line)) {
+      descParts.push(line);
+    }
+  }
+  flushRow();
+
+  return items.filter((r) => r.description && (r.amount || r.price || r.qty));
+}
+
 /**
  * PRODUCT DESCRIPTION 블록마다 렌즈/금액 줄 추출
  * - 동일 설명 아래 QTY/PRICE/GST/AMOUNT 행이 여러 줄이면 각각 별도 라인 아이템
@@ -464,6 +942,14 @@ function extractProductLineItems(normalized) {
       continue;
     }
 
+    const pairRows = parseHoyaProductNumericPairRows(block);
+    if (pairRows.length > 0) {
+      for (const row of pairRows) {
+        items.push(row);
+      }
+      continue;
+    }
+
     const tableStart = block.search(/\bQTY\b/i);
     let numericRows = [];
     if (tableStart >= 0) {
@@ -472,14 +958,23 @@ function extractProductLineItems(normalized) {
     }
 
     if (numericRows.length > 0) {
+      const headerDesc = description?.trim() || '';
       for (const row of numericRows) {
         items.push({
-          description,
+          description: headerDesc,
           qty: row.qty,
           price: row.price,
           gst: row.gst,
           amount: row.amount
         });
+      }
+      continue;
+    }
+
+    const sameLineLens = parseHoyaLensRowsTrailingFourNumbers(block);
+    if (sameLineLens.length > 0) {
+      for (const row of sameLineLens) {
+        items.push(row);
       }
       continue;
     }
@@ -493,13 +988,26 @@ function extractProductLineItems(normalized) {
       block.match(/\bAMOUNT\s*([$€£]?\s*[\d,.-]+)/i) ||
       block.match(/\bTOTAL\s*([$€£]?\s*[\d,.-]+)/i);
 
-    items.push({
-      description,
-      qty: qtyMatch ? qtyMatch[1].trim() : null,
-      price: priceMatch ? priceMatch[1].trim() : null,
-      gst: gstMatch ? gstMatch[1].trim() : null,
-      amount: amtMatch ? amtMatch[1].trim() : null
-    });
+    const loose = (s) => parseFloat(String(s || '').replace(/[^0-9.-]/g, ''));
+    const qtyN = qtyMatch ? loose(qtyMatch[1]) : NaN;
+    const priceN = priceMatch ? loose(priceMatch[1]) : NaN;
+    const amtN = amtMatch ? loose(amtMatch[1]) : NaN;
+    const descOk = Boolean(description?.trim());
+    const okPair =
+      descOk &&
+      Number.isFinite(qtyN) &&
+      qtyN > 0 &&
+      ((Number.isFinite(priceN) && priceN > 0) || (Number.isFinite(amtN) && amtN > 0));
+
+    if (okPair) {
+      items.push({
+        description,
+        qty: qtyMatch ? qtyMatch[1].trim() : null,
+        price: priceMatch ? priceMatch[1].trim() : null,
+        gst: gstMatch ? gstMatch[1].trim() : null,
+        amount: amtMatch ? amtMatch[1].trim() : null
+      });
+    }
   }
 
   return items;
