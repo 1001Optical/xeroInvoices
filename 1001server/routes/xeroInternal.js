@@ -1,6 +1,9 @@
 /**
  * 외부 워커·별도 서버용 access token 발급.
  * 상세: ../docs/XERO_INTERNAL_ACCESS_TOKEN.md
+ *
+ * 이 라우트는 쿼리(?entity, ?accessEntity 등)를 읽지 않습니다.
+ * 항상 DEFAULT_ENTITY(기본 1001 Optical Pty Ltd) = xero_tokens id 1 기준으로만 발급합니다.
  */
 import express from 'express';
 import {
@@ -8,7 +11,6 @@ import {
   getAccessTokenRemainingSeconds,
   getTenantIdForEntity,
   DEFAULT_ENTITY,
-  ENTITY_CONFIG,
   resolveEntityConfig
 } from '../utils/xero.js';
 
@@ -45,63 +47,52 @@ xeroInternalRouter.get('/access-token', async (req, res) => {
     });
   }
 
-  const raw = req.query.entity != null ? String(req.query.entity).trim() : '';
-  const entity = raw || DEFAULT_ENTITY;
-  const rawAccessEntity =
-    req.query.accessEntity != null ? String(req.query.accessEntity).trim() : '';
-
-  console.log('[xero internal] GET /access-token 요청', {
-    entity,
-    accessEntity: rawAccessEntity || '(same as entity)'
-  });
-
+  const anchorEntity = DEFAULT_ENTITY;
+  let anchorCfg;
   try {
-    resolveEntityConfig(entity);
+    anchorCfg = resolveEntityConfig(anchorEntity);
   } catch (e) {
-    return res.status(400).json({
+    return res.status(500).json({
       success: false,
-      error: e.message || 'Unknown entity',
-      knownEntities: Object.keys(ENTITY_CONFIG)
+      error: `DEFAULT_ENTITY "${anchorEntity}" 가 ENTITY_CONFIG 에 없습니다: ${e.message || e}`
     });
   }
 
-  let tokenEntity = entity;
-  if (rawAccessEntity) {
-    try {
-      resolveEntityConfig(rawAccessEntity);
-      tokenEntity = rawAccessEntity;
-    } catch (e) {
-      return res.status(400).json({
-        success: false,
-        error: `accessEntity: ${e.message || 'Unknown entity'}`,
-        knownEntities: Object.keys(ENTITY_CONFIG)
-      });
-    }
-  }
+  console.log('[xero internal] GET /access-token (항상 xero_tokens row)', {
+    xeroTokensRowId: anchorCfg.id,
+    entity: anchorEntity
+  });
 
   try {
-    const accessToken = await getAccessToken(tokenEntity);
-    const expiresIn = getAccessTokenRemainingSeconds(tokenEntity);
-    const tenantId = getTenantIdForEntity(entity);
+    const accessToken = await getAccessToken(anchorEntity);
+    const expiresIn = getAccessTokenRemainingSeconds(anchorEntity);
+    const tenantId = getTenantIdForEntity(anchorEntity);
     if (!tenantId) {
-      const cfg = ENTITY_CONFIG[entity];
-      console.warn('[xero internal] tenantId 없음', entity, cfg.tenantEnv);
+      console.warn('[xero internal] tenantId 없음', anchorEntity, anchorCfg.tenantEnv);
       return res.status(503).json({
         success: false,
-        error: `Tenant ID 환경 변수 ${cfg.tenantEnv} 가 비어 있습니다.`
+        error: `Tenant ID 환경 변수 ${anchorCfg.tenantEnv} 가 비어 있습니다.`
       });
     }
-    console.log('[xero internal] access-token 발급 OK', { entity, tokenEntity });
+    console.log('[xero internal] access-token 발급 OK', {
+      xeroTokensRowId: anchorCfg.id,
+      entity: anchorEntity
+    });
     return res.json({
       success: true,
       accessToken,
       expiresIn,
       tenantId,
-      entity
+      entity: anchorEntity,
+      xeroTokensRowId: anchorCfg.id
     });
   } catch (error) {
     const msg = error.message || 'Token refresh failed';
-    console.error('[xero internal] access-token 실패', { entity, tokenEntity, error: msg });
+    console.error('[xero internal] access-token 실패', {
+      xeroTokensRowId: anchorCfg.id,
+      entity: anchorEntity,
+      error: msg
+    });
     return res.status(500).json({
       success: false,
       error: msg

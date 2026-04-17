@@ -5,6 +5,8 @@
  *   베이스: XERO_INTERNAL_TOKEN_BASE_URL | SERVER_BASE_URL | BACKEND_URL
  *   키: XERO_INTERNAL_API_KEY | BACKEND_API_TOKEN
  * → GET {base}/api/internal/xero/access-token (refresh 는 미들웨어·DB 쪽에만 존재)
+ *   이 내부 API는 쿼리와 무관하게 항상 xero_tokens id 1(DEFAULT_ENTITY) 기준 access·tenantId 만 반환.
+ *   다른 법인 Xero 호출은 같은 access + 호출 쪽 .env 의 해당 Xero-tenant-id(UUID)를 씁니다.
  *
  * OAuth 앱(XERO_CLIENT_ID / XERO_CLIENT_SECRET)은 하나이고, 법인(엔티티)마다
  * 테넌트 UUID 는 ENTITY_CONFIG 의 tenantEnv 로 분리합니다.
@@ -328,11 +330,9 @@ async function fetchAccessTokenFromInternalHttp(entityName) {
     );
   }
   const url = `${base}/api/internal/xero/access-token`;
-  const issuer = getXeroAccessTokenIssuerEntity();
   let res;
   try {
     res = await axios.get(url, {
-      params: { entity: entityName, accessEntity: issuer },
       headers: { Authorization: `Bearer ${apiKey}` },
       validateStatus: () => true
     });
@@ -366,7 +366,13 @@ async function fetchAccessTokenFromInternalHttp(entityName) {
     );
   }
   const reqKey = String(entityName);
-  if (data.tenantId && String(data.tenantId).trim()) {
+  const respEntity = String(data.entity ?? '').trim();
+  if (
+    data.tenantId &&
+    String(data.tenantId).trim() &&
+    respEntity &&
+    respEntity === reqKey
+  ) {
     tenantIdFromInternalApi.set(reqKey, String(data.tenantId).trim());
   }
   const expiresInSec = Number(data.expiresIn) || 0;

@@ -5,10 +5,8 @@ export const rootEndpointsDocumentation = {
   xeroInternalAccessToken: {
     method: 'GET',
     path: '/api/internal/xero/access-token',
-    query: {
-      entity:
-        '법인명 문자열 (ENTITY_CONFIG 키와 동일, 예: 1001 Optical Pty Ltd). 미입력 시 DEFAULT_ENTITY'
-    },
+    query:
+      '무시됨 (?entity 등). 항상 DEFAULT_ENTITY(기본 1001 Optical Pty Ltd) = xero_tokens id 1 만 사용',
     headers: {
       Authorization: 'Bearer <XERO_INTERNAL_API_KEY>',
       'x-api-key': '대안: XERO_INTERNAL_API_KEY 값'
@@ -17,10 +15,12 @@ export const rootEndpointsDocumentation = {
       success: 'boolean',
       accessToken: 'string',
       expiresIn: '초 단위 남은 유효 시간',
-      tenantId: '해당 엔티티 테넌트 UUID',
-      entity: 'string'
+      tenantId: 'DEFAULT_ENTITY(Optical) 테넌트 UUID — 다른 법인은 호출 쪽 .env *_TENANT_ID',
+      entity: '항상 DEFAULT_ENTITY 문자열 (예: 1001 Optical Pty Ltd)',
+      xeroTokensRowId: '1 (ENTITY_CONFIG / DB id)'
     },
-    note: 'refresh_token 미포함. identity 호출은 1001server/utils/xero.js 에서만 수행.'
+    note:
+      'refresh_token 미포함. 멀티 테넌트 Xero 호출 시 access 는 이 토큰, Xero-tenant-id 는 각 법인 env. identity 호출은 1001server/utils/xero.js 에서만 수행.'
   },
   gmailPubSubPush: {
     method: 'POST',
