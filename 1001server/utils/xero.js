@@ -398,8 +398,8 @@ function isXeroRefreshIssuerProcess() {
 
 function shouldUseInternalHttpForRefresh() {
   if (!usesInternalHttpAccessToken()) return false;
-  if (tokenPersistenceEnvOnly) return false;
   if (isXeroRefreshIssuerProcess()) return false;
+  /** tokenPersistenceEnvOnly 여도 BACKEND_URL+키 있으면 MW만 사용 (로컬 RT 미사용) */
   return true;
 }
 
