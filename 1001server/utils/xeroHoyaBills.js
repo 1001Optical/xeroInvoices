@@ -11,6 +11,7 @@
  *   HOYA_XERO_DEBUG_ATTACH_PUT=1 → PUT 직전 비교용 한 줄 (tenantId, invoiceId, tokenFpSha256_12)
  *   HOYA_XERO_DEBUG_ATTACH_PUT_VERBOSE=1 → 위 + 상세 JSON
  *   HOYA_XERO_DEBUG_ORG=1 → 같은 토큰·테넌트로 GET Organisation 스냅샷 (권한/조직 비교용)
+ *   HOYA_XERO_FIND_INVOICE_RETRIES=5 (기본) → find ACCPAY/크레딧 시 429·503 재시도 횟수
  */
 import axios from 'axios';
 import { createHash } from 'crypto';
@@ -593,10 +594,34 @@ function sanitizeAttachmentFileName(name) {
   return String(name).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 200);
 }
 
+/** PUT 과 동일한 규칙으로 정규화한 파일명이 이미 Xero 첨부 목록에 있으면 중복 업로드 방지 */
+function xeroAlreadyHasAttachmentNamed(attachments, uploadFileName) {
+  const want = sanitizeAttachmentFileName(uploadFileName);
+  const list = Array.isArray(attachments) ? attachments : [];
+  return list.some((a) => {
+    const fn = a?.FileName != null ? String(a.FileName) : '';
+    return sanitizeAttachmentFileName(fn) === want;
+  });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+/** 동일 테넌트·같은 InvoiceNumber/CreditNoteNumber 로 동시에 create 가 나가지 않게 직렬화 (PM2 중복·429 재시도 시 이중 Draft 방지) */
+const hoyaXeroExclusiveChains = new Map();
+
+function runHoyaXeroExclusive(serialKey, fn) {
+  const prev = hoyaXeroExclusiveChains.get(serialKey) || Promise.resolve();
+  const next = prev.then(() => fn());
+  hoyaXeroExclusiveChains.set(serialKey, next.catch(() => {}));
+  return next;
+}
+
 /**
  * ACCPAY 중복 방지: UI Reference = API InvoiceNumber (공급자 인보이스 번호, 예 IN05339094)
  */
-async function findAccPayBySupplierInvoiceNumber(accessToken, tenantId, supplierInvoiceNumber) {
+async function findAccPayBySupplierInvoiceNumberOnce(accessToken, tenantId, supplierInvoiceNumber) {
   const ref = sanitizeReferenceForXero(supplierInvoiceNumber);
   if (!ref) return null;
   const safeRef = ref.replace(/"/g, '');
@@ -617,11 +642,34 @@ async function findAccPayBySupplierInvoiceNumber(accessToken, tenantId, supplier
   );
 }
 
+async function findAccPayBySupplierInvoiceNumber(accessToken, tenantId, supplierInvoiceNumber) {
+  const ref = sanitizeReferenceForXero(supplierInvoiceNumber);
+  if (!ref) return null;
+  const maxTry = Math.max(1, Math.min(8, Number(process.env.HOYA_XERO_FIND_INVOICE_RETRIES || 5)));
+  let lastErr;
+  for (let attempt = 0; attempt < maxTry; attempt++) {
+    try {
+      return await findAccPayBySupplierInvoiceNumberOnce(accessToken, tenantId, supplierInvoiceNumber);
+    } catch (e) {
+      lastErr = e;
+      const st = e.response?.status;
+      if (st === 429 || st === 503) {
+        const waitMs = Math.min(10_000, 350 * 2 ** attempt);
+        console.warn('[Hoya Xero] find ACCPAY 재시도', { referenceNumber: ref, attempt: attempt + 1, status: st, waitMs });
+        await sleep(waitMs);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
+}
+
 /**
  * 공급자 크레딧(ACCPAYCREDIT) — Invoices 가 아니라 CreditNotes API 사용
  * @see https://developer.xero.com/documentation/api/accounting/creditnotes
  */
-async function findSupplierCreditByCreditNoteNumber(accessToken, tenantId, creditNoteNumber) {
+async function findSupplierCreditByCreditNoteNumberOnce(accessToken, tenantId, creditNoteNumber) {
   const ref = sanitizeReferenceForXero(creditNoteNumber);
   if (!ref) return null;
   const safeRef = ref.replace(/"/g, '');
@@ -641,6 +689,34 @@ async function findSupplierCreditByCreditNoteNumber(accessToken, tenantId, credi
         sanitizeReferenceForXero(cn.CreditNoteNumber) === ref && cn.Type === 'ACCPAYCREDIT'
     ) || null
   );
+}
+
+async function findSupplierCreditByCreditNoteNumber(accessToken, tenantId, creditNoteNumber) {
+  const ref = sanitizeReferenceForXero(creditNoteNumber);
+  if (!ref) return null;
+  const maxTry = Math.max(1, Math.min(8, Number(process.env.HOYA_XERO_FIND_INVOICE_RETRIES || 5)));
+  let lastErr;
+  for (let attempt = 0; attempt < maxTry; attempt++) {
+    try {
+      return await findSupplierCreditByCreditNoteNumberOnce(accessToken, tenantId, creditNoteNumber);
+    } catch (e) {
+      lastErr = e;
+      const st = e.response?.status;
+      if (st === 429 || st === 503) {
+        const waitMs = Math.min(10_000, 350 * 2 ** attempt);
+        console.warn('[Hoya Xero] find ACCPAYCREDIT 재시도', {
+          creditNoteNumber: ref,
+          attempt: attempt + 1,
+          status: st,
+          waitMs
+        });
+        await sleep(waitMs);
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw lastErr;
 }
 
 async function createSupplierCreditNote(accessToken, tenantId, body) {
@@ -962,88 +1038,99 @@ export async function ensureHoyaAccPayAndAttach(opts) {
     storeLine
   });
 
-  let existing = await findAccPayBySupplierInvoiceNumber(accessToken, tenantId, refTrim);
+  return runHoyaXeroExclusive(`ACCPAY|${tenantId}|${refTrim}`, async () => {
+    let existing = await findAccPayBySupplierInvoiceNumber(accessToken, tenantId, refTrim);
 
-  let invoiceId;
-  if (existing?.InvoiceID) {
-    invoiceId = existing.InvoiceID;
-    console.log('[Hoya Xero] ACCPAY 기존 건(InvoiceNumber·UI Reference 일치) — 첨부만 진행', {
-      invoiceId,
-      referenceNumber: refTrim,
-      entityName,
-      existingDate: existing.DateString ?? existing.Date
-    });
-  } else {
-    const created = await createAccPayInvoice(accessToken, tenantId, {
-      Type: 'ACCPAY',
-      Contact: { ContactID: contactId },
-      Date: date,
-      DueDate: dueDate,
-      InvoiceNumber: refTrim,
-      CurrencyCode: currency,
-      Status: 'DRAFT',
-      LineAmountTypes: 'Exclusive',
-      LineItems: xeroLineItems
-    });
-    invoiceId = created.InvoiceID;
-    console.log('[Hoya Xero] ACCPAY 생성', {
-      invoiceId,
-      referenceNumber: refTrim,
-      entityName,
-      lines: xeroLineItems.length
-    });
-  }
-
-  const detail = await getInvoiceDetail(accessToken, tenantId, invoiceId);
-  if (refTrim && !String(detail?.InvoiceNumber || '').trim()) {
-    try {
-      await postInvoiceMinimalUpdate(accessToken, tenantId, {
-        InvoiceID: invoiceId,
-        InvoiceNumber: refTrim
-      });
-      console.log('[Hoya Xero] Bill InvoiceNumber(UI Reference) 가 비어 있어 파싱값으로 보정', {
+    let invoiceId;
+    if (existing?.InvoiceID) {
+      invoiceId = existing.InvoiceID;
+      console.log('[Hoya Xero] ACCPAY 기존 건(InvoiceNumber·UI Reference 일치) — 첨부만 진행', {
         invoiceId,
-        InvoiceNumber: refTrim
+        referenceNumber: refTrim,
+        entityName,
+        existingDate: existing.DateString ?? existing.Date
       });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn('[Hoya Xero] InvoiceNumber 보정 실패 (Xero에서 수동 입력)', {
-        invoiceId,
+    } else {
+      const created = await createAccPayInvoice(accessToken, tenantId, {
+        Type: 'ACCPAY',
+        Contact: { ContactID: contactId },
+        Date: date,
+        DueDate: dueDate,
         InvoiceNumber: refTrim,
-        error: msg
+        CurrencyCode: currency,
+        Status: 'DRAFT',
+        LineAmountTypes: 'Exclusive',
+        LineItems: xeroLineItems
+      });
+      invoiceId = created.InvoiceID;
+      console.log('[Hoya Xero] ACCPAY 생성', {
+        invoiceId,
+        referenceNumber: refTrim,
+        entityName,
+        lines: xeroLineItems.length
       });
     }
-  }
 
-  const attCount = detail?.Attachments?.length ?? 0;
-  if (attCount >= MAX_ATTACHMENTS_PER_INVOICE) {
-    const msg = `인보이스 ${invoiceId} 첨부 ${attCount}개 — 최대 ${MAX_ATTACHMENTS_PER_INVOICE}개`;
-    logXeroError({ referenceNumber: refTrim, invoiceId, error: msg });
-    throw new Error(msg);
-  }
-
-  const tokenFpAfterGetDetail = hoyaXeroDebugAttachPutEnabled()
-    ? xeroAccessTokenFingerprint(accessToken)
-    : null;
-
-  await uploadInvoicePdfAttachment(
-    accessToken,
-    tenantId,
-    invoiceId,
-    attachmentFileName,
-    pagePdfBuffer,
-    {
-      entityName,
-      tokenFpAfterGetAccess,
-      tokenFpAfterGetDetail
+    const detail = await getInvoiceDetail(accessToken, tenantId, invoiceId);
+    if (refTrim && !String(detail?.InvoiceNumber || '').trim()) {
+      try {
+        await postInvoiceMinimalUpdate(accessToken, tenantId, {
+          InvoiceID: invoiceId,
+          InvoiceNumber: refTrim
+        });
+        console.log('[Hoya Xero] Bill InvoiceNumber(UI Reference) 가 비어 있어 파싱값으로 보정', {
+          invoiceId,
+          InvoiceNumber: refTrim
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[Hoya Xero] InvoiceNumber 보정 실패 (Xero에서 수동 입력)', {
+          invoiceId,
+          InvoiceNumber: refTrim,
+          error: msg
+        });
+      }
     }
-  );
-  console.log('[Hoya Xero] 첨부 업로드', {
-    invoiceId,
-    referenceNumber: refTrim,
-    file: attachmentFileName,
-    bytes: pagePdfBuffer.length,
-    accPaySource: existing?.InvoiceID ? 'reference_reuse' : 'new_create'
+
+    const attCount = detail?.Attachments?.length ?? 0;
+    if (attCount >= MAX_ATTACHMENTS_PER_INVOICE) {
+      const msg = `인보이스 ${invoiceId} 첨부 ${attCount}개 — 최대 ${MAX_ATTACHMENTS_PER_INVOICE}개`;
+      logXeroError({ referenceNumber: refTrim, invoiceId, error: msg });
+      throw new Error(msg);
+    }
+
+    if (xeroAlreadyHasAttachmentNamed(detail?.Attachments, attachmentFileName)) {
+      console.log('[Hoya Xero] 첨부 이미 동일 파일명 존재 — 업로드 스킵', {
+        invoiceId,
+        referenceNumber: refTrim,
+        file: sanitizeAttachmentFileName(attachmentFileName)
+      });
+      return;
+    }
+
+    const tokenFpAfterGetDetail = hoyaXeroDebugAttachPutEnabled()
+      ? xeroAccessTokenFingerprint(accessToken)
+      : null;
+
+    await uploadInvoicePdfAttachment(
+      accessToken,
+      tenantId,
+      invoiceId,
+      attachmentFileName,
+      pagePdfBuffer,
+      {
+        entityName,
+        tokenFpAfterGetAccess,
+        tokenFpAfterGetDetail
+      }
+    );
+    console.log('[Hoya Xero] 첨부 업로드', {
+      invoiceId,
+      referenceNumber: refTrim,
+      file: attachmentFileName,
+      bytes: pagePdfBuffer.length,
+      accPaySource: existing?.InvoiceID ? 'reference_reuse' : 'new_create'
+    });
   });
 }
 
@@ -1124,89 +1211,100 @@ export async function ensureHoyaSupplierCreditAndAttach(opts) {
     storeLine
   });
 
-  let existing = await findSupplierCreditByCreditNoteNumber(
-    accessToken,
-    tenantId,
-    refTrim
-  );
+  return runHoyaXeroExclusive(`ACCPAYCREDIT|${tenantId}|${refTrim}`, async () => {
+    let existing = await findSupplierCreditByCreditNoteNumber(
+      accessToken,
+      tenantId,
+      refTrim
+    );
 
-  let creditNoteId;
-  if (existing?.CreditNoteID) {
-    creditNoteId = existing.CreditNoteID;
-    console.log('[Hoya Xero] ACCPAYCREDIT 기존 건(CreditNoteNumber 일치) — 첨부만 진행', {
-      creditNoteId,
-      creditNoteNumber: refTrim,
-      entityName
-    });
-  } else {
-    const created = await createSupplierCreditNote(accessToken, tenantId, {
-      Type: 'ACCPAYCREDIT',
-      Contact: { ContactID: contactId },
-      Date: date,
-      DueDate: dueDate,
-      CreditNoteNumber: refTrim,
-      CurrencyCode: currency,
-      Status: 'DRAFT',
-      LineAmountTypes: 'Exclusive',
-      LineItems: xeroLineItems
-    });
-    creditNoteId = created.CreditNoteID;
-    console.log('[Hoya Xero] ACCPAYCREDIT 생성 (CreditNotes)', {
-      creditNoteId,
-      creditNoteNumber: refTrim,
-      entityName,
-      lines: xeroLineItems.length
-    });
-  }
-
-  const detail = await getCreditNoteDetail(accessToken, tenantId, creditNoteId);
-  if (refTrim && !String(detail?.CreditNoteNumber || '').trim()) {
-    try {
-      await postCreditNoteMinimalUpdate(accessToken, tenantId, {
-        CreditNoteID: creditNoteId,
-        CreditNoteNumber: refTrim
-      });
-      console.log('[Hoya Xero] CreditNoteNumber 보정', {
+    let creditNoteId;
+    if (existing?.CreditNoteID) {
+      creditNoteId = existing.CreditNoteID;
+      console.log('[Hoya Xero] ACCPAYCREDIT 기존 건(CreditNoteNumber 일치) — 첨부만 진행', {
         creditNoteId,
-        CreditNoteNumber: refTrim
+        creditNoteNumber: refTrim,
+        entityName
       });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn('[Hoya Xero] CreditNoteNumber 보정 실패', {
+    } else {
+      const created = await createSupplierCreditNote(accessToken, tenantId, {
+        Type: 'ACCPAYCREDIT',
+        Contact: { ContactID: contactId },
+        Date: date,
+        DueDate: dueDate,
+        CreditNoteNumber: refTrim,
+        CurrencyCode: currency,
+        Status: 'DRAFT',
+        LineAmountTypes: 'Exclusive',
+        LineItems: xeroLineItems
+      });
+      creditNoteId = created.CreditNoteID;
+      console.log('[Hoya Xero] ACCPAYCREDIT 생성 (CreditNotes)', {
         creditNoteId,
-        error: msg
+        creditNoteNumber: refTrim,
+        entityName,
+        lines: xeroLineItems.length
       });
     }
-  }
 
-  const attCount = detail?.Attachments?.length ?? 0;
-  if (attCount >= MAX_ATTACHMENTS_PER_INVOICE) {
-    const msg = `크레딧 노트 ${creditNoteId} 첨부 ${attCount}개 — 최대 ${MAX_ATTACHMENTS_PER_INVOICE}개`;
-    logXeroError({ referenceNumber: refTrim, invoiceId: creditNoteId, error: msg });
-    throw new Error(msg);
-  }
-
-  const tokenFpAfterGetDetail = hoyaXeroDebugAttachPutEnabled()
-    ? xeroAccessTokenFingerprint(accessToken)
-    : null;
-
-  await uploadCreditNotePdfAttachment(
-    accessToken,
-    tenantId,
-    creditNoteId,
-    attachmentFileName,
-    pagePdfBuffer,
-    {
-      entityName,
-      tokenFpAfterGetAccess,
-      tokenFpAfterGetDetail
+    const detail = await getCreditNoteDetail(accessToken, tenantId, creditNoteId);
+    if (refTrim && !String(detail?.CreditNoteNumber || '').trim()) {
+      try {
+        await postCreditNoteMinimalUpdate(accessToken, tenantId, {
+          CreditNoteID: creditNoteId,
+          CreditNoteNumber: refTrim
+        });
+        console.log('[Hoya Xero] CreditNoteNumber 보정', {
+          creditNoteId,
+          CreditNoteNumber: refTrim
+        });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn('[Hoya Xero] CreditNoteNumber 보정 실패', {
+          creditNoteId,
+          error: msg
+        });
+      }
     }
-  );
-  console.log('[Hoya Xero] 크레딧 첨부 업로드', {
-    creditNoteId,
-    creditNoteNumber: refTrim,
-    file: attachmentFileName,
-    bytes: pagePdfBuffer.length,
-    accPaySource: existing?.CreditNoteID ? 'reference_reuse' : 'new_create'
+
+    const attCount = detail?.Attachments?.length ?? 0;
+    if (attCount >= MAX_ATTACHMENTS_PER_INVOICE) {
+      const msg = `크레딧 노트 ${creditNoteId} 첨부 ${attCount}개 — 최대 ${MAX_ATTACHMENTS_PER_INVOICE}개`;
+      logXeroError({ referenceNumber: refTrim, invoiceId: creditNoteId, error: msg });
+      throw new Error(msg);
+    }
+
+    if (xeroAlreadyHasAttachmentNamed(detail?.Attachments, attachmentFileName)) {
+      console.log('[Hoya Xero] 크레딧 첨부 이미 동일 파일명 존재 — 업로드 스킵', {
+        creditNoteId,
+        creditNoteNumber: refTrim,
+        file: sanitizeAttachmentFileName(attachmentFileName)
+      });
+      return;
+    }
+
+    const tokenFpAfterGetDetail = hoyaXeroDebugAttachPutEnabled()
+      ? xeroAccessTokenFingerprint(accessToken)
+      : null;
+
+    await uploadCreditNotePdfAttachment(
+      accessToken,
+      tenantId,
+      creditNoteId,
+      attachmentFileName,
+      pagePdfBuffer,
+      {
+        entityName,
+        tokenFpAfterGetAccess,
+        tokenFpAfterGetDetail
+      }
+    );
+    console.log('[Hoya Xero] 크레딧 첨부 업로드', {
+      creditNoteId,
+      creditNoteNumber: refTrim,
+      file: attachmentFileName,
+      bytes: pagePdfBuffer.length,
+      accPaySource: existing?.CreditNoteID ? 'reference_reuse' : 'new_create'
+    });
   });
 }

@@ -4,6 +4,7 @@
  * - 메일 1통에 PDF 첨부가 **여러 개**일 수 있음 → **각 PDF마다** 순차 처리
  * - 각 PDF는 **여러 페이지**일 수 있음 → **페이지 1장 = 인보이스 1건** (파싱 + Xero Bill 또는 Supplier Credit + 해당 페이지 PDF 첨부)
  * - 같은 메일 안에서 ref|date 중복은 스킵 (seenKeysThisMessage)
+ * - Xero 첨부 파일명은 IN…_p1.pdf 형태로 고정(소스 Gmail 파일명 미포함) — 재시도·다중 PDF 시 같은 Bill에 PDF가 두 번 쌓이는 것을 줄임
  * - 한 PDF에서 실패해도 **다음 PDF**는 계속 시도 (예전에는 첫 실패 시 return false 로 뒤 첨부 미처리)
  */
 import { createPayableGmailClient } from './gmailPayableAuth.js';
@@ -25,14 +26,6 @@ import {
 
 function sanitizeForFileRef(ref) {
   return String(ref).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 80);
-}
-
-/** 여러 PDF에 같은 ref·페이지 조합이 드물게 겹칠 때 첨부 파일명 구분용 */
-function attachmentNamePrefixFromFilename(filename) {
-  const base = String(filename || 'pdf')
-    .replace(/^.*[/\\]/, '')
-    .replace(/\.pdf$/i, '');
-  return sanitizeForFileRef(base).slice(0, 60);
 }
 
 const HOYA_FROM = /axd365au@hoya\.com/i;
@@ -398,8 +391,7 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
 
       const pageIdx = inv.page - 1;
       const pagePdf = pageBuffers[pageIdx];
-      const srcPrefix = attachmentNamePrefixFromFilename(filename);
-      const attachName = `${srcPrefix}_${sanitizeForFileRef(ref)}_p${inv.page}.pdf`;
+      const attachName = `${sanitizeForFileRef(ref)}_p${inv.page}.pdf`;
 
       const xeroOpts = {
         referenceNumber: ref,
