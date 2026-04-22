@@ -395,6 +395,18 @@ function hoyaLineItemHasAnySignal(li) {
   return q !== 0 || p !== 0 || a !== 0;
 }
 
+/** 금액·세액·수량×단가가 모두 0이면 Bill/크레딧 라인으로 넣지 않음 (예: MISC R SPH 0.00 … 전부 0) */
+function hoyaLineItemHasNonZeroMoney(li) {
+  const gst = parseMoney(li?.gst);
+  if (Math.abs(gst) > 1e-9) return true;
+  const amt = parseMoney(li?.amount);
+  if (Math.abs(amt) > 1e-9) return true;
+  const q = parseMoney(li?.qty);
+  const p = parseMoney(li?.price);
+  if (Math.abs(q * p) > 1e-9) return true;
+  return false;
+}
+
 /**
  * PDF 본문에서 CUSTOMER REF / ORDER ID 블록만 뽑아 한 줄 Description 문자열로 합침 (Xero 추가 라인용)
  * ORDER ID 값이 라벨 다음 줄에만 있는 경우(빈 줄·공백 허용) 첫 비어 있지 않은 줄을 사용
@@ -452,7 +464,9 @@ function buildAccPayLineItems({
   }
 
   const lines = [];
-  const usable = (lineItems || []).filter(hoyaLineItemHasAnySignal);
+  const usable = (lineItems || [])
+    .filter(hoyaLineItemHasAnySignal)
+    .filter(hoyaLineItemHasNonZeroMoney);
   for (const li of usable) {
     const qty = parseMoney(li.qty);
     const unitAmount = parseMoney(li.price);
@@ -528,7 +542,9 @@ function buildAccPayCreditLineItems({
   }
 
   const lines = [];
-  const usable = (lineItems || []).filter(hoyaLineItemHasAnySignal);
+  const usable = (lineItems || [])
+    .filter(hoyaLineItemHasAnySignal)
+    .filter(hoyaLineItemHasNonZeroMoney);
   for (const li of usable) {
     let q = parseMoney(li.qty);
     let ua = parseMoney(li.price);
