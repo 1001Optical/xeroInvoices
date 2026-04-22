@@ -395,6 +395,32 @@ function hoyaLineItemHasAnySignal(li) {
   return q !== 0 || p !== 0 || a !== 0;
 }
 
+/**
+ * PDF 본문에서 CUSTOMER REF / ORDER ID 블록만 뽑아 한 줄 Description 문자열로 합침 (Xero 추가 라인용)
+ * ORDER ID 값이 라벨 다음 줄에만 있는 경우(빈 줄·공백 허용) 첫 비어 있지 않은 줄을 사용
+ */
+function buildHoyaMetaRefOrderDescription(fullPageText) {
+  if (fullPageText == null || fullPageText === '') return '';
+  const t = String(fullPageText).replace(/\r\n/g, '\n');
+
+  let customerRef = '';
+  const mCr = t.match(/CUSTOMER\s+REF\s*:\s*([^\n]*)/i);
+  if (mCr) customerRef = String(mCr[1] || '').trim();
+
+  let orderId = '';
+  const mOi = t.match(/ORDER\s+ID\s*:/i);
+  if (mOi) {
+    const tail = t.slice(mOi.index + mOi[0].length);
+    const mVal = tail.match(/(?:^\s*\n)*\s*([^\n]+)/);
+    if (mVal) orderId = String(mVal[1] || '').trim();
+  }
+
+  const parts = [];
+  if (customerRef) parts.push(`CUSTOMER REF: ${customerRef}`);
+  if (orderId) parts.push(`ORDER ID: ${orderId}`);
+  return parts.join('  ');
+}
+
 function buildAccPayLineItems({
   lineItems,
   storeNameForTracking,
@@ -403,7 +429,8 @@ function buildAccPayLineItems({
   taxOnExpensesCode,
   singleTaxType,
   referenceNumber,
-  storeLine
+  storeLine,
+  fullPageText
 }) {
   const trackingCategoryName = process.env.HOYA_XERO_TRACKING_CATEGORY_NAME?.trim();
   const trackingCategoryId = process.env.HOYA_XERO_TRACKING_CATEGORY_ID?.trim();
@@ -448,12 +475,25 @@ function buildAccPayLineItems({
     lines.push({
       Description: `Hoya — ${storeLine || referenceNumber}`.slice(0, 4000),
       Quantity: 1,
-      UnitAmount: 0.01,
+      /** 설명-only / 합계에 반영하지 않음 (0.01×N건 누적 방지) */
+      UnitAmount: 0,
       AccountCode: accountCode,
       TaxType: singleTaxType || taxFreeCode,
       ...tracking
     });
   }
+
+  const metaDesc = buildHoyaMetaRefOrderDescription(fullPageText);
+  if (metaDesc) {
+    lines.push({
+      Description: metaDesc.slice(0, 4000),
+      Quantity: 1,
+      UnitAmount: 0,
+      AccountCode: accountCode,
+      TaxType: singleTaxType || taxFreeCode
+    });
+  }
+
   return lines;
 }
 
@@ -466,7 +506,8 @@ function buildAccPayCreditLineItems({
   taxOnExpensesCode,
   singleTaxType,
   referenceNumber,
-  storeLine
+  storeLine,
+  fullPageText
 }) {
   const trackingCategoryName = process.env.HOYA_XERO_TRACKING_CATEGORY_NAME?.trim();
   const trackingCategoryId = process.env.HOYA_XERO_TRACKING_CATEGORY_ID?.trim();
@@ -525,12 +566,24 @@ function buildAccPayCreditLineItems({
     lines.push({
       Description: `Hoya supplier credit — ${storeLine || referenceNumber}`.slice(0, 4000),
       Quantity: 1,
-      UnitAmount: 0.01,
+      UnitAmount: 0,
       AccountCode: accountCode,
       TaxType: singleTaxType || taxFreeCode,
       ...tracking
     });
   }
+
+  const metaDesc = buildHoyaMetaRefOrderDescription(fullPageText);
+  if (metaDesc) {
+    lines.push({
+      Description: metaDesc.slice(0, 4000),
+      Quantity: 1,
+      UnitAmount: 0,
+      AccountCode: accountCode,
+      TaxType: singleTaxType || taxFreeCode
+    });
+  }
+
   return lines;
 }
 
@@ -588,6 +641,23 @@ export function addCalendarDaysToIsoDate(isoYmd, days) {
   );
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Hoya Due Date: 인보이스일 + 60일이 떨어지는 달의 마지막 날 (UTC 달력)
+ * 예: 21 Apr → +60일이 6월 → Due 30 Jun
+ */
+function hoyaDueDateEndOfMonthAfter60Days(isoYmd) {
+  const m = String(isoYmd).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) throw new Error(`날짜 형식 오류: ${isoYmd}`);
+  const d = new Date(
+    Date.UTC(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10))
+  );
+  d.setUTCDate(d.getUTCDate() + 60);
+  const y = d.getUTCFullYear();
+  const mon = d.getUTCMonth();
+  const last = new Date(Date.UTC(y, mon + 1, 0));
+  return last.toISOString().slice(0, 10);
 }
 
 function sanitizeAttachmentFileName(name) {
@@ -1002,7 +1072,7 @@ export async function ensureHoyaAccPayAndAttach(opts) {
   const contactId = await resolveSupplierContactId(accessToken, tenantId, entityName);
   const accountCode = expenseAccountCode();
   const date = parseInvoiceDateToXero(invoiceDateStr);
-  const dueDate = addCalendarDaysToIsoDate(date, 30);
+  const dueDate = hoyaDueDateEndOfMonthAfter60Days(date);
   const currency = process.env.HOYA_XERO_CURRENCY || 'AUD';
 
   /** GST=0 라인. GSTFREE 는 판매 쪽에 쓰이는 경우가 많아 ACCPAY+경비계정에서 400 나는 조직이 많음 → AU 는 보통 EXEMPTEXPENSES */
@@ -1035,7 +1105,8 @@ export async function ensureHoyaAccPayAndAttach(opts) {
     taxOnExpensesCode: taxOnExpenses,
     singleTaxType: singleTax || null,
     referenceNumber: refTrim,
-    storeLine
+    storeLine,
+    fullPageText
   });
 
   return runHoyaXeroExclusive(`ACCPAY|${tenantId}|${refTrim}`, async () => {
@@ -1190,7 +1261,7 @@ export async function ensureHoyaSupplierCreditAndAttach(opts) {
   const contactId = await resolveSupplierContactId(accessToken, tenantId, entityName);
   const accountCode = expenseAccountCode();
   const date = parseInvoiceDateToXero(invoiceDateStr);
-  const dueDate = addCalendarDaysToIsoDate(date, 30);
+  const dueDate = hoyaDueDateEndOfMonthAfter60Days(date);
   const currency = process.env.HOYA_XERO_CURRENCY || 'AUD';
 
   const taxFree =
@@ -1208,7 +1279,8 @@ export async function ensureHoyaSupplierCreditAndAttach(opts) {
     taxOnExpensesCode: taxOnExpenses,
     singleTaxType: singleTax || null,
     referenceNumber: refTrim,
-    storeLine
+    storeLine,
+    fullPageText
   });
 
   return runHoyaXeroExclusive(`ACCPAYCREDIT|${tenantId}|${refTrim}`, async () => {
