@@ -1129,7 +1129,7 @@ export async function ensureHoyaAccPayAndAttach(opts) {
         DueDate: dueDate,
         InvoiceNumber: refTrim,
         CurrencyCode: currency,
-        Status: 'DRAFT',
+        Status: 'AUTHORISED',
         LineAmountTypes: 'Exclusive',
         LineItems: xeroLineItems
       });
@@ -1306,7 +1306,7 @@ export async function ensureHoyaSupplierCreditAndAttach(opts) {
         DueDate: dueDate,
         CreditNoteNumber: refTrim,
         CurrencyCode: currency,
-        Status: 'DRAFT',
+        Status: 'AUTHORISED',
         LineAmountTypes: 'Exclusive',
         LineItems: xeroLineItems
       });
