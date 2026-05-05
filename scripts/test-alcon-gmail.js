@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Alcon TAX INVOICE 메일 — Gmail 검색·PDF inspect·파싱만 (Xero 없음)
+ * Alcon TAX INVOICE 메일 — Gmail 검색·PDF inspect·파싱, run 시 Xero 업로드
+ * PDF는 파일당 1페이지가 기본.
  *
  *   node scripts/test-alcon-gmail.js list
  *   node scripts/test-alcon-gmail.js list --q 'from:my.accounts@alcon.com newer_than:7d'
@@ -18,6 +19,7 @@ import {
 } from '../1001server/utils/gmailHoyaPipeline.js';
 import { processAlconGmailMessage } from '../1001server/utils/gmailAlconPipeline.js';
 import { inspectAlconPdfBuffer } from '../1001server/utils/alconPdfParser.js';
+import { initXeroTokenServiceEnvOnly } from '../1001server/utils/xero.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
@@ -166,6 +168,7 @@ async function main() {
       usage();
       process.exit(1);
     }
+    initXeroTokenServiceEnvOnly();
     const outcome = await processAlconGmailMessage(gmail, args.messageId, userEmail);
     console.log('[Alcon] outcome:', outcome);
     process.exit(outcome === 'failed' ? 1 : 0);

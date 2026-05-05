@@ -1,6 +1,7 @@
 /**
  * Alcon TAX INVOICE 메일 — PDF 텍스트 추출·파싱만 (Xero/매핑은 추후).
  * 제목: Your Alcon TAX INVOICE, 발신: my.accounts@alcon.com
+ * PDF: 파일당 1페이지·1인보이스 (호야 multi-page combined 와 다름).
  */
 import { createPayableGmailClient } from './gmailPayableAuth.js';
 import {
@@ -11,12 +12,15 @@ import {
 } from './gmailHistoryState.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { parseAlconTaxInvoicePdf } from './alconPdfParser.js';
+import { ensureAlconAccPayAndAttach } from './xeroAlconBills.js';
 import {
   bufferLooksLikePdf,
   collectPdfAttachmentsFromPayload
 } from './gmailHoyaPipeline.js';
 
-const ALCON_FROM = /my\.accounts@alcon\.com/i;
+/** Gmail From 표시명 기준 고정: "Alcon Laboratories (Australia) Pty Ltd*" */
+const ALCON_FROM = /Alcon\s+Laboratories\s+\(Australia\)\s+Pty\s+Ltd\*?/i;
+const ALCON_FROM_EMAIL = /my\.accounts@alcon\.com/i;
 const ALCON_TAX_INVOICE_SUBJECT = /Your\s+Alcon\s+TAX\s+INVOICE/i;
 
 function getHeader(headers, name) {
@@ -27,7 +31,9 @@ function getHeader(headers, name) {
 function isAlconTaxInvoiceMail(headers) {
   const subj = getHeader(headers, 'Subject');
   const from = getHeader(headers, 'From');
-  return ALCON_TAX_INVOICE_SUBJECT.test(subj) && ALCON_FROM.test(from);
+  const subjectOk = ALCON_TAX_INVOICE_SUBJECT.test(subj);
+  const fromOk = ALCON_FROM.test(from) || ALCON_FROM_EMAIL.test(from);
+  return subjectOk && fromOk;
 }
 
 function logAlconPdfError({ messageId, attachmentFilename, page, error }) {
@@ -49,7 +55,7 @@ function logAlconPdfError({ messageId, attachmentFilename, page, error }) {
 /**
  * @returns {Promise<AlconProcessOutcome>}
  *   skipped — 알콘 인보이스 메일 아님
- *   success — 알콘 메일이고 첨부 PDF 파싱까지 완료 (로그 출력)
+ *   success — 알콘 메일이고 첨부 PDF 파싱 + Xero 업로드 완료
  *   failed — 알콘 메일인데 PDF 없음·다운로드/파싱 오류
  */
 export async function processAlconGmailMessage(gmail, messageId, userEmail) {
@@ -63,6 +69,14 @@ export async function processAlconGmailMessage(gmail, messageId, userEmail) {
 
   const headers = full.data.payload?.headers || [];
   if (!isAlconTaxInvoiceMail(headers)) {
+    console.log(
+      '[Alcon] skip (header mismatch)',
+      JSON.stringify({
+        messageId,
+        subject: getHeader(headers, 'Subject'),
+        from: getHeader(headers, 'From')
+      })
+    );
     return 'skipped';
   }
 
@@ -154,21 +168,28 @@ export async function processAlconGmailMessage(gmail, messageId, userEmail) {
     }
 
     for (const inv of parsed.invoices) {
-      console.log(
-        '[Alcon] 페이지 파싱 결과 (매핑 전)',
-        filename,
-        'page',
-        inv.page,
-        JSON.stringify(
-          {
-            attachmentFileName: inv.attachmentFileName,
-            mergedTextSample: inv.mergedText.slice(0, 2000),
-            fieldsPlaceholder: inv.fields
-          },
-          null,
-          2
-        )
-      );
+      try {
+        await ensureAlconAccPayAndAttach({
+          fields: inv.fields,
+          pagePdfBuffer: buffer,
+          attachmentFileName: filename
+        });
+      } catch (err) {
+        hadFailure = true;
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error(
+          '[Alcon Xero error]',
+          JSON.stringify({
+            messageId,
+            attachmentFilename: filename,
+            page: inv.page,
+            invoiceNumber: inv.fields?.invoiceNumber || null,
+            billToNumber: inv.fields?.billToNumber || null,
+            error: msg,
+            xero: err.response?.data || null
+          })
+        );
+      }
     }
   }
 
