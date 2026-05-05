@@ -3,7 +3,18 @@
  * @see https://cloud.google.com/pubsub/docs/push
  * @see https://developers.google.com/gmail/api/guides/push
  */
-import { runHoyaGmailPipeline } from './gmailHoyaPipeline.js';
+import { createPayableGmailClient } from './gmailPayableAuth.js';
+import {
+  getLastHistoryId,
+  setLastHistoryId,
+  hasProcessedMessageId,
+  addProcessedMessageId,
+  hasProcessedAlconMessageId,
+  addProcessedAlconMessageId
+} from './gmailHistoryState.js';
+import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
+import { processHoyaGmailMessage } from './gmailHoyaPipeline.js';
+import { processAlconGmailMessage } from './gmailAlconPipeline.js';
 
 /**
  * Pub/Sub push 본문에서 Gmail 알림 JSON 추출
@@ -58,7 +69,84 @@ export function parsePubSubGmailNotification(body) {
 }
 
 /**
- * Hoya Daily Combined Invoice PDF 파이프라인 (비동기, await 하지 않음)
+ * Hoya + Alcon Payable 인보이스: history 한 번 조회 후 메일마다 Alcon → Hoya 순 처리, historyId 는 배치 전부 성공 시에만 갱신
+ * @param {object} parsed parsePubSubGmailNotification 결과
+ */
+export async function runPayableGmailPipelines(parsed) {
+  const userEmail = parsed?.gmail?.emailAddress;
+  const newHistoryId = parsed?.gmail?.historyId;
+  if (!userEmail || !newHistoryId) return;
+
+  let gmail;
+  try {
+    gmail = createPayableGmailClient();
+  } catch (e) {
+    console.error('[Gmail Payables] 클라이언트:', e.message);
+    return;
+  }
+
+  const last = await getLastHistoryId(userEmail);
+  const messageIds = await collectMessageIdsSinceHistoryForPayables(
+    gmail,
+    userEmail,
+    last
+  );
+
+  console.log('[Gmail Payables] history 배치', {
+    mailbox: userEmail,
+    lastHistoryId: last ?? '(없음·폴백 목록 사용)',
+    newHistoryId,
+    candidateMessages: messageIds.size,
+    sampleIds: [...messageIds].slice(0, 8)
+  });
+
+  if (messageIds.size === 0) {
+    console.log('[Gmail Payables] 신규 메시지 없음 → historyId 갱신', newHistoryId);
+    await setLastHistoryId(userEmail, newHistoryId);
+    return;
+  }
+
+  let batchFailed = false;
+
+  for (const id of messageIds) {
+    try {
+      if (!(await hasProcessedAlconMessageId(userEmail, id))) {
+        const alconOutcome = await processAlconGmailMessage(gmail, id, userEmail);
+        if (alconOutcome === 'failed') {
+          batchFailed = true;
+        } else if (alconOutcome === 'success') {
+          await addProcessedAlconMessageId(userEmail, id);
+        }
+      }
+
+      if (!(await hasProcessedMessageId(userEmail, id))) {
+        const hoyaOk = await processHoyaGmailMessage(gmail, id, userEmail);
+        if (!hoyaOk) {
+          batchFailed = true;
+        } else {
+          await addProcessedMessageId(userEmail, id);
+        }
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[Gmail Payables] message 실패', id, msg);
+      batchFailed = true;
+    }
+  }
+
+  if (!batchFailed) {
+    await setLastHistoryId(userEmail, newHistoryId);
+    console.log('[Gmail Payables] 배치 성공 → lastHistoryId=', newHistoryId);
+  } else {
+    console.warn(
+      '[Gmail Payables] 배치에 실패 포함 → lastHistoryId 유지 (재시도 가능). 새 값=',
+      newHistoryId
+    );
+  }
+}
+
+/**
+ * Pub/Sub 푸시 — Hoya·Alcon Payable 파이프라인 (비동기 시작)
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export function onGmailPubSubNotification(parsed) {
@@ -74,7 +162,7 @@ export function onGmailPubSubNotification(parsed) {
       parsed.gmail.historyId
     );
   }
-  void runHoyaGmailPipeline(parsed).catch((err) => {
-    console.error('[Hoya pipeline]', err.message);
+  void runPayableGmailPipelines(parsed).catch((err) => {
+    console.error('[Gmail Payables pipeline]', err.message);
   });
 }

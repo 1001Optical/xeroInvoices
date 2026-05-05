@@ -23,6 +23,7 @@ import {
   ensureHoyaAccPayAndAttach,
   ensureHoyaSupplierCreditAndAttach
 } from './xeroHoyaBills.js';
+import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 
 function sanitizeForFileRef(ref) {
   return String(ref).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 80);
@@ -165,12 +166,6 @@ export function collectPdfAttachmentsFromPayload(payload) {
   return [...primary, ...extra];
 }
 
-function isHoyaDailyCombinedInvoice(headers) {
-  const subj = getHeader(headers, 'Subject');
-  const from = getHeader(headers, 'From');
-  return DAILY_COMBINED_SUBJECT.test(subj) && HOYA_FROM.test(from);
-}
-
 function logPdfParseError({ messageId, attachmentFilename, page, error }) {
   console.error(
     '[Hoya PDF error]',
@@ -181,17 +176,6 @@ function logPdfParseError({ messageId, attachmentFilename, page, error }) {
       error
     })
   );
-}
-
-async function listRecentHoyaFallback(gmail, ids) {
-  const res = await gmail.users.messages.list({
-    userId: 'me',
-    q: 'from:axd365au@hoya.com subject:"Daily Combined Invoice" newer_than:14d',
-    maxResults: 20
-  });
-  for (const m of res.data.messages || []) {
-    if (m.id) ids.add(m.id);
-  }
 }
 
 /**
@@ -210,7 +194,19 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
   });
 
   const headers = full.data.payload?.headers || [];
-  if (!isHoyaDailyCombinedInvoice(headers)) {
+  const subjEarly = getHeader(headers, 'Subject');
+  const fromEarly = getHeader(headers, 'From');
+  if (!HOYA_FROM.test(fromEarly)) {
+    return true;
+  }
+  if (!DAILY_COMBINED_SUBJECT.test(subjEarly)) {
+    console.warn(
+      '[Hoya] 스킵 — HOYA 발신(axd365au@hoya.com)인데 제목이 Daily Combined Invoice 가 아님',
+      JSON.stringify({
+        messageId,
+        subject: subjEarly.slice(0, 280)
+      })
+    );
     return true;
   }
 
@@ -503,39 +499,12 @@ export async function runHoyaGmailPipeline(parsed) {
     return;
   }
 
-  const messageIds = new Set();
   const last = await getLastHistoryId(userEmail);
-
-  if (last) {
-    try {
-      let pageToken;
-      do {
-        const hist = await gmail.users.history.list({
-          userId: 'me',
-          startHistoryId: last,
-          pageToken,
-          historyTypes: ['messageAdded']
-        });
-
-        for (const h of hist.data.history || []) {
-          for (const added of h.messagesAdded || []) {
-            if (added.message?.id) messageIds.add(added.message.id);
-          }
-        }
-        pageToken = hist.data.nextPageToken || undefined;
-      } while (pageToken);
-    } catch (e) {
-      const status = e.response?.status || e.code;
-      if (status === 404) {
-        console.warn('[Hoya Gmail] history 404 — 최근 메일로 대체 조회');
-        await listRecentHoyaFallback(gmail, messageIds);
-      } else {
-        throw e;
-      }
-    }
-  } else {
-    await listRecentHoyaFallback(gmail, messageIds);
-  }
+  const messageIds = await collectMessageIdsSinceHistoryForPayables(
+    gmail,
+    userEmail,
+    last
+  );
 
   if (messageIds.size === 0) {
     console.log('[Hoya] 신규 메시지 없음 → historyId 갱신만 수행', newHistoryId);

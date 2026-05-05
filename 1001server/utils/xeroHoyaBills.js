@@ -11,7 +11,9 @@
  *   HOYA_XERO_DEBUG_ATTACH_PUT=1 → PUT 직전 비교용 한 줄 (tenantId, invoiceId, tokenFpSha256_12)
  *   HOYA_XERO_DEBUG_ATTACH_PUT_VERBOSE=1 → 위 + 상세 JSON
  *   HOYA_XERO_DEBUG_ORG=1 → 같은 토큰·테넌트로 GET Organisation 스냅샷 (권한/조직 비교용)
- *   HOYA_XERO_FIND_INVOICE_RETRIES=5 (기본) → find ACCPAY/크레딧 시 429·503 재시도 횟수
+ *   HOYA_XERO_FIND_INVOICE_RETRIES=8 (기본, 최대 12) → find ACCPAY/크레딧 시 429·503 재시도
+ *   HOYA_XERO_MIN_REQUEST_INTERVAL_MS=280 (기본) → api.xro/2.0 호출 사이 최소 간격 (429 완화)
+ *   HOYA_XERO_RATE_LIMIT_DISABLED=1 → 위 간격·직렬 게이트 끄기 (디버그용)
  */
 import axios from 'axios';
 import { createHash } from 'crypto';
@@ -61,9 +63,59 @@ function xeroAccessTokenFingerprint(accessToken) {
 
 /** 401 시 어떤 URL에서 터졌는지 로그 (스코프·엔드포인트 추적용) */
 const hoyaXeroHttp = axios.create();
+
+/** 같은 Node 프로세스 안에서 api.xro/2.0 호출이 겹치지 않게 직렬화 + 이전 응답 이후 최소 간격 (429 완화) */
+let hoyaXeroAccountingGateChain = Promise.resolve();
+let hoyaXeroLastAccountingRequestEnd = 0;
+
+function hoyaXeroAccountingRateLimitEnabled() {
+  return !/^(1|true|yes)$/i.test(
+    String(process.env.HOYA_XERO_RATE_LIMIT_DISABLED || '').trim()
+  );
+}
+
+function hoyaXeroMinRequestIntervalMs() {
+  const n = Number(process.env.HOYA_XERO_MIN_REQUEST_INTERVAL_MS ?? 280);
+  if (!Number.isFinite(n) || n < 0) return 280;
+  return Math.min(10_000, n);
+}
+
+function isHoyaXeroAccountingApiUrl(url) {
+  if (url == null) return false;
+  const u = String(url);
+  return u.includes('api.xro/2.0') || u.startsWith(API);
+}
+
+function hoyaXeroAccountingReleaseGate(config) {
+  if (config?.__hoyaAccountingGateRelease) {
+    hoyaXeroLastAccountingRequestEnd = Date.now();
+    const rel = config.__hoyaAccountingGateRelease;
+    delete config.__hoyaAccountingGateRelease;
+    rel();
+  }
+}
+
+hoyaXeroHttp.interceptors.request.use(async (config) => {
+  if (!hoyaXeroAccountingRateLimitEnabled() || !isHoyaXeroAccountingApiUrl(config.url)) {
+    return config;
+  }
+  await hoyaXeroAccountingGateChain;
+  hoyaXeroAccountingGateChain = new Promise((resolve) => {
+    config.__hoyaAccountingGateRelease = resolve;
+  });
+  const gap = hoyaXeroMinRequestIntervalMs();
+  const wait = Math.max(0, hoyaXeroLastAccountingRequestEnd + gap - Date.now());
+  if (wait > 0) await sleep(wait);
+  return config;
+});
+
 hoyaXeroHttp.interceptors.response.use(
-  (r) => r,
+  (r) => {
+    hoyaXeroAccountingReleaseGate(r.config);
+    return r;
+  },
   (err) => {
+    hoyaXeroAccountingReleaseGate(err.config);
     const st = err.response?.status;
     const u = err.config?.url;
     const d = err.response?.data?.Detail || err.response?.data?.Title;
@@ -694,6 +746,21 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+/** 429 응답의 Retry-After(초)가 있으면 그만큼 대기, 없으면 fallbackMs */
+function xeroRetryWaitMs(err, fallbackMs) {
+  try {
+    const h = err.response?.headers?.['retry-after'] ?? err.response?.headers?.['Retry-After'];
+    if (h == null || h === '') return fallbackMs;
+    const sec = parseInt(String(h).trim(), 10);
+    if (Number.isFinite(sec) && sec > 0) {
+      return Math.min(120_000, sec * 1000);
+    }
+  } catch {
+    /* ignore */
+  }
+  return fallbackMs;
+}
+
 /** 동일 테넌트·같은 InvoiceNumber/CreditNoteNumber 로 동시에 create 가 나가지 않게 직렬화 (PM2 중복·429 재시도 시 이중 Draft 방지) */
 const hoyaXeroExclusiveChains = new Map();
 
@@ -731,7 +798,7 @@ async function findAccPayBySupplierInvoiceNumberOnce(accessToken, tenantId, supp
 async function findAccPayBySupplierInvoiceNumber(accessToken, tenantId, supplierInvoiceNumber) {
   const ref = sanitizeReferenceForXero(supplierInvoiceNumber);
   if (!ref) return null;
-  const maxTry = Math.max(1, Math.min(8, Number(process.env.HOYA_XERO_FIND_INVOICE_RETRIES || 5)));
+  const maxTry = Math.max(1, Math.min(12, Number(process.env.HOYA_XERO_FIND_INVOICE_RETRIES || 8)));
   let lastErr;
   for (let attempt = 0; attempt < maxTry; attempt++) {
     try {
@@ -740,8 +807,15 @@ async function findAccPayBySupplierInvoiceNumber(accessToken, tenantId, supplier
       lastErr = e;
       const st = e.response?.status;
       if (st === 429 || st === 503) {
-        const waitMs = Math.min(10_000, 350 * 2 ** attempt);
-        console.warn('[Hoya Xero] find ACCPAY 재시도', { referenceNumber: ref, attempt: attempt + 1, status: st, waitMs });
+        const fallback = Math.min(35_000, 400 * 2 ** attempt);
+        const waitMs = xeroRetryWaitMs(e, fallback);
+        console.warn('[Hoya Xero] find ACCPAY 재시도', {
+          referenceNumber: ref,
+          attempt: attempt + 1,
+          status: st,
+          waitMs,
+          retryAfterHeader: e.response?.headers?.['retry-after'] ?? e.response?.headers?.['Retry-After'] ?? null
+        });
         await sleep(waitMs);
         continue;
       }
@@ -780,7 +854,7 @@ async function findSupplierCreditByCreditNoteNumberOnce(accessToken, tenantId, c
 async function findSupplierCreditByCreditNoteNumber(accessToken, tenantId, creditNoteNumber) {
   const ref = sanitizeReferenceForXero(creditNoteNumber);
   if (!ref) return null;
-  const maxTry = Math.max(1, Math.min(8, Number(process.env.HOYA_XERO_FIND_INVOICE_RETRIES || 5)));
+  const maxTry = Math.max(1, Math.min(12, Number(process.env.HOYA_XERO_FIND_INVOICE_RETRIES || 8)));
   let lastErr;
   for (let attempt = 0; attempt < maxTry; attempt++) {
     try {
@@ -789,12 +863,14 @@ async function findSupplierCreditByCreditNoteNumber(accessToken, tenantId, credi
       lastErr = e;
       const st = e.response?.status;
       if (st === 429 || st === 503) {
-        const waitMs = Math.min(10_000, 350 * 2 ** attempt);
+        const fallback = Math.min(35_000, 400 * 2 ** attempt);
+        const waitMs = xeroRetryWaitMs(e, fallback);
         console.warn('[Hoya Xero] find ACCPAYCREDIT 재시도', {
           creditNoteNumber: ref,
           attempt: attempt + 1,
           status: st,
-          waitMs
+          waitMs,
+          retryAfterHeader: e.response?.headers?.['retry-after'] ?? e.response?.headers?.['Retry-After'] ?? null
         });
         await sleep(waitMs);
         continue;

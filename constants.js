@@ -1,29 +1,28 @@
-
-  export const BRANCHES = [
-    {code:'BKT', name:'Blacktown', entity:'1001 Optical Pty Ltd'},
-    {code:'BON', name:'Bondi', entity:'1001 Optical Pty Ltd'},
-    {code:'BUR', name:'Burwood', entity:'1001 Optical Pty Ltd'}, 
-    {code:'CHC', name:'Chatswood Chase', entity:'1001 Chatswood Chase Pty Ltd'},
-    {code:'CHW', name:'Chatswood Westfield', entity:'WSQ Eyecare Pty ltd', bankEntity:'1001 Optical Pty Ltd'},
-    {code:'ETG', name:'Eastgardens', entity:'AJ Eyecare Pty Ltd'},
-    {code:'HOB', name:'Hornsby', entity:'1001 Optical Pty Ltd'},
-    {code:'HUR', name:'Hurstville', entity:'1001 Hurstville Pty Ltd'},
-    {code:'EMP', name:'Melbourne Emporium', entity:'1001 Optical Pty Ltd'},
-    {code:'PA1', name:'Parramatta', entity:'1001 Optical Pty Ltd'},
-    {code:'PEN', name:'Penrith', entity:'1001 Optical Pty Ltd'},
-    {code:'BOH', name:'Box Hill', entity:'CNC Eyecare Pty Ltd'},
-    {code:'DON', name:'Doncaster', entity:'CNC Eyecare Pty Ltd'},
-    {code:'MQU', name:'Macquarie', entity:'SK Eyecare Pty Ltd'},
-    {code:'TOP', name:'Top Ryde', entity:'JSJ Eyecare Pty Ltd'},
-    {code:'IND', name:'Indooroopilly', entity:'1001 Indooroopilly Pty Ltd'},
-    {
-      code: 'NTL',
-      name: 'Online',
-      entity: '1001 Optical Pty Ltd',
-      /** PDF SOLD TO 등에 매장명 대신 이 문구로 오는 경우 (Hoya 등) */
-      invoiceAliases: ['1001 OPTICAL CENTRAL DISTRIBUTION', 'OPTICAL CENTRAL DISTRIBUTION']
-    }
-  ]
+export const BRANCHES = [
+  {code:'BKT', name:'Blacktown', entity:'1001 Optical Pty Ltd', alconAccount:'100380150'},
+  {code:'BON', name:'Bondi', entity:'1001 Optical Pty Ltd', alconAccount:'100379772'},
+  {code:'BUR', name:'Burwood', entity:'1001 Optical Pty Ltd', alconAccount:'100384169'}, 
+  {code:'CHC', name:'Chatswood Chase', entity:'1001 Chatswood Chase Pty Ltd', alconAccount:'100382056'},
+  {code:'CHW', name:'Chatswood Westfield', entity:'WSQ Eyecare Pty ltd', bankEntity:'1001 Optical Pty Ltd', alconAccount:'100378373'},
+  {code:'ETG', name:'Eastgardens', entity:'AJ Eyecare Pty Ltd', alconAccount:'100381266'},
+  {code:'HOB', name:'Hornsby', entity:'1001 Optical Pty Ltd', alconAccount:'100381906'},
+  {code:'HUR', name:'Hurstville', entity:'1001 Hurstville Pty Ltd', alconAccount:'100607767'},
+  {code:'EMP', name:'Melbourne Emporium', entity:'1001 Optical Pty Ltd', alconAccount:'100536224'},
+  {code:'PA1', name:'Parramatta', entity:'1001 Optical Pty Ltd', alconAccount:'100381239'},
+  {code:'PEN', name:'Penrith', entity:'1001 Optical Pty Ltd', alconAccount:'100383616'},
+  {code:'BOH', name:'Box Hill', entity:'CNC Eyecare Pty Ltd', alconAccount:'100383181'},
+  {code:'DON', name:'Doncaster', entity:'CNC Eyecare Pty Ltd', alconAccount:'100377962'},
+  {code:'MQU', name:'Macquarie', entity:'SK Eyecare Pty Ltd', alconAccount:'100384382'},
+  {code:'TOP', name:'Top Ryde', entity:'JSJ Eyecare Pty Ltd', alconAccount:'100382245'},
+  {code:'IND', name:'Indooroopilly', entity:'1001 Indooroopilly Pty Ltd', alconAccount:'100642136'},
+  {
+    code: 'NTL',
+    name: 'Online',
+    entity: '1001 Optical Pty Ltd',
+    alconAccount:'100379071',
+    invoiceAliases: ['1001 OPTICAL CENTRAL DISTRIBUTION', 'OPTICAL CENTRAL DISTRIBUTION']
+  }
+];
   
 
 export const STOCK_TYPES = [
@@ -72,3 +71,6 @@ export const PAYMENT_TYPES = [
   { code: "LAT", description: "Pay Later - LatitudePay", accountCode: "18004" }
 ];
   
+
+export const ACCOUNT_CODES = [
+]
