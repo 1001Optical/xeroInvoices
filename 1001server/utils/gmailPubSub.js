@@ -14,7 +14,7 @@ import {
 } from './gmailHistoryState.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { processHoyaGmailMessage } from './gmailHoyaPipeline.js';
-import { processAlconGmailMessage } from './gmailAlconPipeline.js';
+import { processArtmostGmailMessage } from './gmailArtmostPipeline.js';
 
 /**
  * Pub/Sub push 본문에서 Gmail 알림 JSON 추출
@@ -69,7 +69,7 @@ export function parsePubSubGmailNotification(body) {
 }
 
 /**
- * Hoya + Alcon Payable 인보이스: history 한 번 조회 후 메일마다 Alcon → Hoya 순 처리, historyId 는 배치 전부 성공 시에만 갱신
+ * Hoya + Artmost Payable 인보이스: history 한 번 조회 후 메일마다 Artmost → Hoya 순 처리, historyId 는 배치 전부 성공 시에만 갱신
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export async function runPayableGmailPipelines(parsed) {
@@ -111,10 +111,10 @@ export async function runPayableGmailPipelines(parsed) {
   for (const id of messageIds) {
     try {
       if (!(await hasProcessedAlconMessageId(userEmail, id))) {
-        const alconOutcome = await processAlconGmailMessage(gmail, id, userEmail);
-        if (alconOutcome === 'failed') {
+        const artmostOutcome = await processArtmostGmailMessage(gmail, id, userEmail);
+        if (artmostOutcome === 'failed') {
           batchFailed = true;
-        } else if (alconOutcome === 'success') {
+        } else if (artmostOutcome === 'success') {
           await addProcessedAlconMessageId(userEmail, id);
         }
       }
@@ -146,7 +146,7 @@ export async function runPayableGmailPipelines(parsed) {
 }
 
 /**
- * Pub/Sub 푸시 — Hoya·Alcon Payable 파이프라인 (비동기 시작)
+ * Pub/Sub 푸시 — Hoya·Artmost Payable 파이프라인 (비동기 시작)
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export function onGmailPubSubNotification(parsed) {
