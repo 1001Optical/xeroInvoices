@@ -24,6 +24,7 @@ import {
   ensureHoyaSupplierCreditAndAttach
 } from './xeroHoyaBills.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
+import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
 function sanitizeForFileRef(ref) {
   return String(ref).replace(/[<>:"/\\|?*\x00-\x1f]/g, '_').slice(0, 80);
@@ -187,11 +188,20 @@ function logPdfParseError({ messageId, attachmentFilename, page, error }) {
 async function processOneMessage(gmail, messageId, userEmail, options = {}) {
   const skipInvoiceDedupe = Boolean(options.skipInvoiceDedupe);
   const skipPersistInvoiceKeys = Boolean(options.skipPersistInvoiceKeys);
-  const full = await gmail.users.messages.get({
-    userId: 'me',
-    id: messageId,
-    format: 'full'
-  });
+  let full;
+  try {
+    full = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'full'
+    });
+  } catch (err) {
+    if (isGmailRequestedEntityNotFound(err)) {
+      console.warn('[Hoya] messages.get 404 — 삭제·만료된 ID, 건너뜀', messageId);
+      return true;
+    }
+    throw err;
+  }
 
   const headers = full.data.payload?.headers || [];
   const subjEarly = getHeader(headers, 'Subject');
@@ -528,6 +538,11 @@ export async function runHoyaGmailPipeline(parsed) {
       }
       await addProcessedMessageId(userEmail, id);
     } catch (err) {
+      if (isGmailRequestedEntityNotFound(err)) {
+        console.warn('[Hoya] message 건너뜀 (Gmail 404)', id);
+        await addProcessedMessageId(userEmail, id);
+        continue;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Hoya] message 실패', id, msg);
       batchFailed = true;

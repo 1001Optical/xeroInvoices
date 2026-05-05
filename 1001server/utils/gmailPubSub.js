@@ -15,6 +15,7 @@ import {
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { processHoyaGmailMessage } from './gmailHoyaPipeline.js';
 import { processArtmostGmailMessage } from './gmailArtmostPipeline.js';
+import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
 /**
  * Pub/Sub push 본문에서 Gmail 알림 JSON 추출
@@ -114,7 +115,7 @@ export async function runPayableGmailPipelines(parsed) {
         const artmostOutcome = await processArtmostGmailMessage(gmail, id, userEmail);
         if (artmostOutcome === 'failed') {
           batchFailed = true;
-        } else if (artmostOutcome === 'success') {
+        } else if (artmostOutcome === 'success' || artmostOutcome === 'orphan') {
           await addProcessedAlconMessageId(userEmail, id);
         }
       }
@@ -128,6 +129,12 @@ export async function runPayableGmailPipelines(parsed) {
         }
       }
     } catch (err) {
+      if (isGmailRequestedEntityNotFound(err)) {
+        console.warn('[Gmail Payables] message 건너뜀 (Gmail 404)', id);
+        await addProcessedMessageId(userEmail, id);
+        await addProcessedAlconMessageId(userEmail, id);
+        continue;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Gmail Payables] message 실패', id, msg);
       batchFailed = true;

@@ -17,6 +17,7 @@ import {
   bufferLooksLikePdf,
   collectPdfAttachmentsFromPayload
 } from './gmailHoyaPipeline.js';
+import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
 /** Gmail From 표시명 기준 고정: "Alcon Laboratories (Australia) Pty Ltd*" */
 const ALCON_FROM = /Alcon\s+Laboratories\s+\(Australia\)\s+Pty\s+Ltd\*?/i;
@@ -49,7 +50,8 @@ function logAlconPdfError({ messageId, attachmentFilename, page, error }) {
 }
 
 /**
- * @typedef {'skipped' | 'success' | 'failed'} AlconProcessOutcome
+ * @typedef {'skipped' | 'success' | 'failed' | 'orphan'} AlconProcessOutcome
+ *   orphan — Gmail messages.get 404 (삭제·고아 history ID)
  */
 
 /**
@@ -57,15 +59,25 @@ function logAlconPdfError({ messageId, attachmentFilename, page, error }) {
  *   skipped — 알콘 인보이스 메일 아님
  *   success — 알콘 메일이고 첨부 PDF 파싱 + Xero 업로드 완료
  *   failed — 알콘 메일인데 PDF 없음·다운로드/파싱 오류
+ *   orphan — 메시지 ID 가 Gmail 에 없음 (404)
  */
 export async function processAlconGmailMessage(gmail, messageId, userEmail) {
   void userEmail;
 
-  const full = await gmail.users.messages.get({
-    userId: 'me',
-    id: messageId,
-    format: 'full'
-  });
+  let full;
+  try {
+    full = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'full'
+    });
+  } catch (err) {
+    if (isGmailRequestedEntityNotFound(err)) {
+      console.warn('[Alcon] messages.get 404 건너뜀', messageId);
+      return 'orphan';
+    }
+    throw err;
+  }
 
   const headers = full.data.payload?.headers || [];
   if (!isAlconTaxInvoiceMail(headers)) {
@@ -242,12 +254,21 @@ export async function runAlconGmailPipeline(parsed) {
       if (outcome === 'skipped') {
         continue;
       }
+      if (outcome === 'orphan') {
+        await addProcessedAlconMessageId(userEmail, id);
+        continue;
+      }
       if (outcome === 'failed') {
         batchFailed = true;
         continue;
       }
       await addProcessedAlconMessageId(userEmail, id);
     } catch (err) {
+      if (isGmailRequestedEntityNotFound(err)) {
+        console.warn('[Alcon] message 건너뜀 (Gmail 404)', id);
+        await addProcessedAlconMessageId(userEmail, id);
+        continue;
+      }
       const msg = err instanceof Error ? err.message : String(err);
       console.error('[Alcon] message 실패', id, msg);
       batchFailed = true;

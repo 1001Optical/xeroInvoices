@@ -1,6 +1,6 @@
 /**
  * Artmost 주문 영수증 메일 — PDF 파싱 후 Xero ACCPAY 생성/첨부.
- * 제목: Your ArtMost GOV Contact Lenses Australia order receipt ...
+ * 제목: … order receipt … 또는 … order from … is complete (동일 발신자)
  * 발신: admin@artmostgovau.com.au
  */
 import { createPayableGmailClient } from './gmailPayableAuth.js';
@@ -17,20 +17,26 @@ import {
   bufferLooksLikePdf,
   collectPdfAttachmentsFromPayload
 } from './gmailHoyaPipeline.js';
+import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
 const ARTMOST_FROM_EMAIL = /admin@artmostgovau\.com\.au/i;
-const ARTMOST_RECEIPT_SUBJECT =
-  /Your\s+ArtMost\s+GOV\s+Contact\s+Lenses\s+Australia\s+order\s+receipt/i;
+/** receipt 메일 + “order … is complete” 알림 모두 동일 PDF 패턴으로 처리 */
+const ARTMOST_ORDER_SUBJECT_BASE =
+  /Your\s+ArtMost\s+GOV\s+Contact\s+Lenses\s+Australia\s+order\b/i;
 
 function getHeader(headers, name) {
   const h = headers?.find((x) => x.name?.toLowerCase() === name.toLowerCase());
   return h?.value || '';
 }
 
-function isArtmostOrderReceiptMail(headers) {
+function isArtmostOrderMail(headers) {
   const subj = getHeader(headers, 'Subject');
   const from = getHeader(headers, 'From');
-  return ARTMOST_RECEIPT_SUBJECT.test(subj) && ARTMOST_FROM_EMAIL.test(from);
+  if (!ARTMOST_FROM_EMAIL.test(from)) return false;
+  if (!ARTMOST_ORDER_SUBJECT_BASE.test(subj)) return false;
+  const receipt = /order\s+receipt/i.test(subj);
+  const complete = /\bis\s+complete\b/i.test(subj);
+  return receipt || complete;
 }
 
 function logArtmostPdfError({ messageId, attachmentFilename, page, error }) {
@@ -46,7 +52,8 @@ function logArtmostPdfError({ messageId, attachmentFilename, page, error }) {
 }
 
 /**
- * @typedef {'skipped' | 'success' | 'failed'} ArtmostProcessOutcome
+ * @typedef {'skipped' | 'success' | 'failed' | 'orphan'} ArtmostProcessOutcome
+ *   orphan — Gmail messages.get 404 (삭제·고아 history ID), 재시도 불가 → 처리함으로 기록
  */
 
 /**
@@ -54,18 +61,36 @@ function logArtmostPdfError({ messageId, attachmentFilename, page, error }) {
  *   skipped — Artmost 대상 메일 아님
  *   success — PDF 파싱 완료
  *   failed — 대상 메일인데 PDF 없음/다운로드·파싱 오류
+ *   orphan — 메시지 ID 가 Gmail 에 없음 (404)
  */
 export async function processArtmostGmailMessage(gmail, messageId, userEmail) {
   void userEmail;
 
-  const full = await gmail.users.messages.get({
-    userId: 'me',
-    id: messageId,
-    format: 'full'
-  });
+  let full;
+  try {
+    full = await gmail.users.messages.get({
+      userId: 'me',
+      id: messageId,
+      format: 'full'
+    });
+  } catch (err) {
+    if (isGmailRequestedEntityNotFound(err)) {
+      console.warn('[Artmost] messages.get 404 건너뜀', messageId);
+      return 'orphan';
+    }
+    throw err;
+  }
 
   const headers = full.data.payload?.headers || [];
-  if (!isArtmostOrderReceiptMail(headers)) {
+  if (!isArtmostOrderMail(headers)) {
+    console.log(
+      '[Artmost] skip (헤더 불일치 — receipt/complete+admin@artmost 아님)',
+      JSON.stringify({
+        messageId,
+        subject: getHeader(headers, 'Subject')?.slice(0, 200),
+        from: getHeader(headers, 'From')?.slice(0, 200)
+      })
+    );
     return 'skipped';
   }
 
@@ -208,10 +233,15 @@ export async function runArtmostGmailPipeline(parsed) {
         batchFailed = true;
         continue;
       }
-      if (outcome === 'success') {
+      if (outcome === 'success' || outcome === 'orphan') {
         await addProcessedAlconMessageId(userEmail, id);
       }
     } catch (err) {
+      if (isGmailRequestedEntityNotFound(err)) {
+        console.warn('[Artmost] message 건너뜀 (Gmail 404)', id);
+        await addProcessedAlconMessageId(userEmail, id);
+        continue;
+      }
       batchFailed = true;
       console.error('[Artmost] message 실패', id, err instanceof Error ? err.message : String(err));
     }
