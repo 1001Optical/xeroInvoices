@@ -13,9 +13,13 @@ function normSpace(s) {
 }
 
 function parseMoney(s) {
-  const n = parseFloat(String(s || '').replace(/[^0-9.-]/g, ''));
+  const raw = String(s || '').trim();
+  const sign = /^\(.*\)$/.test(raw) && !raw.includes('-') ? -1 : 1;
+  const n = parseFloat(raw.replace(/[^0-9.-]/g, ''));
   return Number.isFinite(n) ? n : 0;
 }
+
+const MONEY_TOKEN = String.raw`\(?-?\$?\s*-?[0-9,]+\.\d{2}\)?`;
 
 function parseDdMmYyyyToIso(s) {
   const m = String(s || '').match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
@@ -65,7 +69,7 @@ function extractArtmostFieldsFromCombinedText(combinedText) {
   for (const hit of flat.matchAll(productLabelRe)) {
     const start = hit.index ?? 0;
     const lookahead = flat.slice(start, start + 1400);
-    const qp = lookahead.match(/(\d+)\s*\$([0-9,]+\.\d{2})/);
+    const qp = lookahead.match(new RegExp(`(\\d+)\\s*(${MONEY_TOKEN})`));
     if (!qp) continue;
     const description = String(hit[0] || '').replace(/\s+/g, ' ').trim();
     const qty = Number(qp[1]);
@@ -78,8 +82,16 @@ function extractArtmostFieldsFromCombinedText(combinedText) {
     productLines.push({ description, qty, lineAmount, unitAmount, taxType: 'GST Free Expenses' });
   }
 
-  const shippingAmount = parseMoney(flat.match(/Shipping\s+\$([0-9,]+\.\d{2})/i)?.[1] || 0);
+  const shippingAmount = parseMoney(
+    flat.match(new RegExp(`Shipping\\s+(${MONEY_TOKEN})`, 'i'))?.[1] || 0
+  );
   const patientName = flat.match(/Patient\s*Name:\s*([A-Za-z][A-Za-z\s]+\d+)/i)?.[1]?.trim() || null;
+  const documentKind =
+    productLines.some((p) => Number(p.lineAmount || 0) < 0) ||
+    shippingAmount < 0 ||
+    /\bcredit\s+note\b|\breturn\b|\brefund\b/i.test(flat)
+      ? 'supplier_credit_note'
+      : 'supplier_invoice';
 
   const xeroDraftLineItems = [
     ...productLines.map((p) => ({
@@ -108,6 +120,7 @@ function extractArtmostFieldsFromCombinedText(combinedText) {
 
   return {
     invoiceNumber,
+    documentKind,
     referenceNumber: invoiceNumber,
     invoiceDate,
     invoiceDateIso,

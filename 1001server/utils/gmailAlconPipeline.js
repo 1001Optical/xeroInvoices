@@ -12,7 +12,10 @@ import {
 } from './gmailHistoryState.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { parseAlconTaxInvoicePdf } from './alconPdfParser.js';
-import { ensureAlconAccPayAndAttach } from './xeroAlconBills.js';
+import {
+  ensureAlconAccPayAndAttach,
+  ensureAlconSupplierCreditAndAttach
+} from './xeroAlconBills.js';
 import {
   bufferLooksLikePdf,
   collectPdfAttachmentsFromPayload
@@ -181,11 +184,16 @@ export async function processAlconGmailMessage(gmail, messageId, userEmail) {
 
     for (const inv of parsed.invoices) {
       try {
-        await ensureAlconAccPayAndAttach({
+        const opts = {
           fields: inv.fields,
           pagePdfBuffer: buffer,
           attachmentFileName: filename
-        });
+        };
+        if (inv.fields?.documentKind === 'supplier_credit_note') {
+          await ensureAlconSupplierCreditAndAttach(opts);
+        } else {
+          await ensureAlconAccPayAndAttach(opts);
+        }
       } catch (err) {
         hadFailure = true;
         const msg = err instanceof Error ? err.message : String(err);
@@ -197,6 +205,7 @@ export async function processAlconGmailMessage(gmail, messageId, userEmail) {
             page: inv.page,
             invoiceNumber: inv.fields?.invoiceNumber || null,
             billToNumber: inv.fields?.billToNumber || null,
+            documentKind: inv.fields?.documentKind || 'supplier_invoice',
             error: msg,
             xero: err.response?.data || null
           })

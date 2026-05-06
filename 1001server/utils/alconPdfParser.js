@@ -70,11 +70,15 @@ function buildReadingOrderText(textContent) {
 /** "27,46" / "1.234,56" → number (호주 PDF는 대체로 마침표 소수) */
 function parseMoneyAud(s) {
   if (s == null || String(s).trim() === '') return null;
-  const t = String(s).trim().replace(/\s/g, '');
+  const raw = String(s).trim();
+  const sign = /^\(.*\)$/.test(raw) && !raw.includes('-') ? -1 : 1;
+  const t = raw.replace(/\s/g, '');
   const euroStyle = /^-?\d{1,3}(\.\d{3})*,\d{2}$/.test(t);
-  const normalized = euroStyle ? t.replace(/\./g, '').replace(',', '.') : t.replace(/,/g, '');
+  const normalized = euroStyle
+    ? t.replace(/[()]/g, '').replace(/\./g, '').replace(',', '.')
+    : t.replace(/[()]/g, '').replace(/,/g, '');
   const n = parseFloat(normalized);
-  return Number.isFinite(n) ? n : null;
+  return Number.isFinite(n) ? sign * n : null;
 }
 
 function alconExpenseAccountCode() {
@@ -98,6 +102,24 @@ function alconTaxTypeOnExpenses() {
 function chooseAlconTaxTypeByGst(gstAmount) {
   const g = Number(gstAmount || 0);
   return g > 0 ? alconTaxTypeOnExpenses() : alconTaxTypeFreeExpenses();
+}
+
+function isAlconSupplierCreditFields({ netGoods, totalFreight, totalGst, total, lineItems, text }) {
+  if ([netGoods, totalFreight, totalGst, total].some((n) => Number(n || 0) < 0)) {
+    return true;
+  }
+  if (
+    (lineItems || []).some(
+      (li) =>
+        Number(li?.unitPriceExGst || 0) < 0 ||
+        Number(li?.extendedPriceExGst || 0) < 0 ||
+        Number(li?.amountDueInclGst || 0) < 0 ||
+        Number(li?.gst || 0) < 0
+    )
+  ) {
+    return true;
+  }
+  return /\bcredit\s+note\b|\breturn\b|\brefund\b/i.test(String(text || ''));
 }
 
 function matchBranchByAlconAccount(alconAccount) {
@@ -351,8 +373,19 @@ export function extractAlconInvoiceFieldsPlaceholder(normalized) {
   const discountAmount = parseMoneyAud(
     text.match(/Material\s+Grp\.\s*Disc\.%\s+(?:\n\s*)+(-?[\d.,]+)/i)?.[1]
   );
+  const documentKind = isAlconSupplierCreditFields({
+    netGoods,
+    totalFreight,
+    totalGst,
+    total,
+    lineItems,
+    text
+  })
+    ? 'supplier_credit_note'
+    : 'supplier_invoice';
 
   return {
+    documentKind,
     billToNumber: billToAccount,
     invoiceNumber,
     invoiceDate,

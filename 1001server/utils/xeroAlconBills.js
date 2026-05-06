@@ -150,6 +150,28 @@ async function findAccPayByInvoiceNumber(accessToken, tenantId, invoiceNumber) {
   return list.find((x) => x.Type === 'ACCPAY' && sanitizeReferenceForXero(x.InvoiceNumber) === ref) || null;
 }
 
+async function findSupplierCreditByCreditNoteNumber(accessToken, tenantId, creditNoteNumber) {
+  const ref = sanitizeReferenceForXero(creditNoteNumber);
+  if (!ref) return null;
+  const where = `CreditNoteNumber=="${ref.replace(/"/g, '')}"`;
+  const url = `${API}/CreditNotes?where=${encodeURIComponent(where)}`;
+  const res = await axios.get(url, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Xero-tenant-id': tenantId,
+      Accept: 'application/json'
+    }
+  });
+  const list = res.data?.CreditNotes || [];
+  return (
+    list.find(
+      (x) =>
+        x.Type === 'ACCPAYCREDIT' &&
+        sanitizeReferenceForXero(x.CreditNoteNumber) === ref
+    ) || null
+  );
+}
+
 async function createAccPayInvoice(accessToken, tenantId, body) {
   const res = await axios.post(
     `${API}/Invoices`,
@@ -179,6 +201,35 @@ async function getInvoiceDetail(accessToken, tenantId, invoiceId) {
   return res.data?.Invoices?.[0] || null;
 }
 
+async function createSupplierCreditNote(accessToken, tenantId, body) {
+  const res = await axios.post(
+    `${API}/CreditNotes`,
+    { CreditNotes: [body] },
+    {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        'Xero-tenant-id': tenantId,
+        'Content-Type': 'application/json',
+        Accept: 'application/json'
+      }
+    }
+  );
+  const cn = res.data?.CreditNotes?.[0];
+  if (!cn?.CreditNoteID) throw new Error('Xero CreditNote 생성 응답에 CreditNoteID 없음');
+  return cn;
+}
+
+async function getCreditNoteDetail(accessToken, tenantId, creditNoteId) {
+  const res = await axios.get(`${API}/CreditNotes/${creditNoteId}`, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Xero-tenant-id': tenantId,
+      Accept: 'application/json'
+    }
+  });
+  return res.data?.CreditNotes?.[0] || null;
+}
+
 function xeroAlreadyHasAttachmentNamed(attachments, uploadFileName) {
   const want = sanitizeAttachmentFileName(uploadFileName);
   return (attachments || []).some((a) => {
@@ -204,19 +255,38 @@ async function uploadInvoicePdfAttachment(accessToken, tenantId, invoiceId, file
   });
 }
 
-function buildXeroLineItems(fields, referenceNumber) {
+async function uploadCreditNotePdfAttachment(accessToken, tenantId, creditNoteId, fileName, pdfBuffer) {
+  if (pdfBuffer.length > MAX_ATTACHMENT_BYTES) {
+    throw new Error(`PDF가 25MB 초과: ${pdfBuffer.length} bytes`);
+  }
+  const safeName = sanitizeAttachmentFileName(fileName);
+  const url = `${API}/CreditNotes/${creditNoteId}/Attachments/${encodeURIComponent(safeName)}`;
+  await axios.put(url, pdfBuffer, {
+    headers: {
+      Authorization: `Bearer ${accessToken}`,
+      'Xero-tenant-id': tenantId,
+      'Content-Type': 'application/pdf'
+    },
+    maxBodyLength: MAX_ATTACHMENT_BYTES + 1,
+    maxContentLength: MAX_ATTACHMENT_BYTES + 1
+  });
+}
+
+function buildXeroLineItems(fields, referenceNumber, { forCredit = false } = {}) {
   const src = Array.isArray(fields?.lineItemsForXero) ? fields.lineItemsForXero : [];
   const tracking = buildTrackingForStore(fields?.matchedBranchName);
   const out = src
     .filter((li) => li && Number(li.qty || 0) > 0)
     .map((li) => {
       const qty = Number(li.qty || 1) || 1;
-      const gst = Number(li.gst || 0);
-      const amountIncl = Number(li.amountDueInclGst || 0);
-      const netLineAmount = amountIncl > 0 ? amountIncl - gst : 0;
+      const gst = Math.abs(Number(li.gst || 0));
+      const amountInclRaw = Number(li.amountDueInclGst || 0);
+      const amountIncl = forCredit ? Math.abs(amountInclRaw) : amountInclRaw;
+      const netLineAmount = amountIncl !== 0 ? amountIncl - gst : 0;
       let unitAmount = qty > 0 ? netLineAmount / qty : netLineAmount;
       if (!(unitAmount > 0)) {
-        unitAmount = Number(li.extendedPriceExGst || li.unitPriceExGst || 0);
+        const fallback = Number(li.extendedPriceExGst || li.unitPriceExGst || 0);
+        unitAmount = forCredit ? Math.abs(fallback) : fallback;
       }
       const accountCode =
         li.lineKind === 'freight' ? alconFreightAccountCode() : alconExpenseAccountCode();
@@ -233,9 +303,9 @@ function buildXeroLineItems(fields, referenceNumber) {
   if (out.length > 0) return out;
   return [
     {
-      Description: `Alcon — ${referenceNumber}`.slice(0, 4000),
+      Description: `Alcon ${forCredit ? 'supplier credit' : 'invoice'} — ${referenceNumber}`.slice(0, 4000),
       Quantity: 1,
-      UnitAmount: Number(fields?.total || 0),
+      UnitAmount: Math.abs(Number(fields?.total || 0)),
       AccountCode: alconExpenseAccountCode(),
       TaxType: mapTaxTypeToXeroCode(fields?.xeroDefaults?.taxFreeCode, 0),
       ...tracking
@@ -313,6 +383,96 @@ export async function ensureAlconAccPayAndAttach(opts) {
   );
   console.log('[Alcon Xero] 첨부 업로드', {
     invoiceId,
+    referenceNumber,
+    file: sanitizeAttachmentFileName(attachmentFileName),
+    bytes: pagePdfBuffer.length
+  });
+}
+
+/**
+ * Alcon 반품/마이너스 PDF → Xero Supplier Credit (ACCPAYCREDIT) 생성/첨부.
+ * CreditNotes API는 금액을 양수 라인으로 받으므로 PDF의 음수 금액은 절대값으로 변환한다.
+ * @param {Parameters<typeof ensureAlconAccPayAndAttach>[0]} opts
+ */
+export async function ensureAlconSupplierCreditAndAttach(opts) {
+  const { fields, pagePdfBuffer, attachmentFileName } = opts;
+  const entityName = fields?.matchedEntity;
+  if (!entityName) {
+    throw new Error(`Bill To 계정 매칭 실패: ${fields?.billToNumber || '(없음)'}`);
+  }
+
+  const referenceNumber = sanitizeReferenceForXero(fields?.invoiceNumber);
+  if (!referenceNumber) throw new Error('invoiceNumber 없음');
+  const invoiceDate = parseInvoiceDateToXero(fields?.invoiceDate);
+  const dueDate = fields?.paymentDueOn
+    ? parseInvoiceDateToXero(fields.paymentDueOn)
+    : invoiceDate;
+
+  const accessToken = await getAccessToken(entityName);
+  const tenantId = getTenantIdForEntity(entityName);
+  if (!tenantId) throw new Error(`테넌트 ID 없음 (법인: ${entityName})`);
+
+  const contactId = await resolveAlconSupplierContactId(accessToken, tenantId, entityName);
+  const lineItems = buildXeroLineItems(fields, referenceNumber, { forCredit: true });
+  if (lineItems.some((x) => !x.AccountCode)) {
+    throw new Error('Alcon credit line item AccountCode 비어 있음');
+  }
+
+  let existing = await findSupplierCreditByCreditNoteNumber(
+    accessToken,
+    tenantId,
+    referenceNumber
+  );
+  let creditNoteId;
+  if (existing?.CreditNoteID) {
+    creditNoteId = existing.CreditNoteID;
+    console.log('[Alcon Xero] ACCPAYCREDIT 기존 건 재사용', {
+      creditNoteId,
+      referenceNumber,
+      entityName
+    });
+  } else {
+    const created = await createSupplierCreditNote(accessToken, tenantId, {
+      Type: 'ACCPAYCREDIT',
+      Contact: { ContactID: contactId },
+      Date: invoiceDate,
+      DueDate: dueDate,
+      CreditNoteNumber: referenceNumber,
+      CurrencyCode: fields?.currency || 'AUD',
+      Status: 'AUTHORISED',
+      LineAmountTypes: 'Exclusive',
+      LineItems: lineItems
+    });
+    creditNoteId = created.CreditNoteID;
+    console.log('[Alcon Xero] ACCPAYCREDIT 생성', {
+      creditNoteId,
+      referenceNumber,
+      entityName,
+      lines: lineItems.length
+    });
+  }
+
+  const detail = await getCreditNoteDetail(accessToken, tenantId, creditNoteId);
+  const attCount = detail?.Attachments?.length ?? 0;
+  if (attCount >= MAX_ATTACHMENTS_PER_INVOICE) {
+    throw new Error(`크레딧 노트 ${creditNoteId} 첨부 ${attCount}개 — 최대 ${MAX_ATTACHMENTS_PER_INVOICE}개`);
+  }
+  if (xeroAlreadyHasAttachmentNamed(detail?.Attachments, attachmentFileName)) {
+    console.log('[Alcon Xero] 크레딧 동일 첨부 파일명 존재 — 업로드 스킵', {
+      creditNoteId,
+      attachmentFileName
+    });
+    return;
+  }
+  await uploadCreditNotePdfAttachment(
+    accessToken,
+    tenantId,
+    creditNoteId,
+    attachmentFileName,
+    pagePdfBuffer
+  );
+  console.log('[Alcon Xero] 크레딧 첨부 업로드', {
+    creditNoteId,
     referenceNumber,
     file: sanitizeAttachmentFileName(attachmentFileName),
     bytes: pagePdfBuffer.length

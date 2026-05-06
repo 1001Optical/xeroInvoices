@@ -9,12 +9,15 @@ import {
   setLastHistoryId,
   hasProcessedMessageId,
   addProcessedMessageId,
+  hasProcessedArtmostMessageId,
+  addProcessedArtmostMessageId,
   hasProcessedAlconMessageId,
   addProcessedAlconMessageId
 } from './gmailHistoryState.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { processHoyaGmailMessage } from './gmailHoyaPipeline.js';
 import { processArtmostGmailMessage } from './gmailArtmostPipeline.js';
+import { processAlconGmailMessage } from './gmailAlconPipeline.js';
 import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
 /**
@@ -70,7 +73,7 @@ export function parsePubSubGmailNotification(body) {
 }
 
 /**
- * Hoya + Artmost Payable 인보이스: history 한 번 조회 후 메일마다 Artmost → Hoya 순 처리, historyId 는 배치 전부 성공 시에만 갱신
+ * Artmost + Alcon + Hoya Payable 인보이스: history 한 번 조회 후 메일마다 Artmost → Alcon → Hoya 순 처리, historyId 는 배치 전부 성공 시에만 갱신
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export async function runPayableGmailPipelines(parsed) {
@@ -111,11 +114,20 @@ export async function runPayableGmailPipelines(parsed) {
 
   for (const id of messageIds) {
     try {
-      if (!(await hasProcessedAlconMessageId(userEmail, id))) {
+      if (!(await hasProcessedArtmostMessageId(userEmail, id))) {
         const artmostOutcome = await processArtmostGmailMessage(gmail, id, userEmail);
         if (artmostOutcome === 'failed') {
           batchFailed = true;
         } else if (artmostOutcome === 'success' || artmostOutcome === 'orphan') {
+          await addProcessedArtmostMessageId(userEmail, id);
+        }
+      }
+
+      if (!(await hasProcessedAlconMessageId(userEmail, id))) {
+        const alconOutcome = await processAlconGmailMessage(gmail, id, userEmail);
+        if (alconOutcome === 'failed') {
+          batchFailed = true;
+        } else if (alconOutcome === 'success' || alconOutcome === 'orphan') {
           await addProcessedAlconMessageId(userEmail, id);
         }
       }
@@ -132,6 +144,7 @@ export async function runPayableGmailPipelines(parsed) {
       if (isGmailRequestedEntityNotFound(err)) {
         console.warn('[Gmail Payables] message 건너뜀 (Gmail 404)', id);
         await addProcessedMessageId(userEmail, id);
+        await addProcessedArtmostMessageId(userEmail, id);
         await addProcessedAlconMessageId(userEmail, id);
         continue;
       }
@@ -153,7 +166,7 @@ export async function runPayableGmailPipelines(parsed) {
 }
 
 /**
- * Pub/Sub 푸시 — Hoya·Artmost Payable 파이프라인 (비동기 시작)
+ * Pub/Sub 푸시 — Artmost·Alcon·Hoya Payable 파이프라인 (비동기 시작)
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export function onGmailPubSubNotification(parsed) {

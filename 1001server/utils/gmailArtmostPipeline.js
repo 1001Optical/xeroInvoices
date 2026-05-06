@@ -7,12 +7,15 @@ import { createPayableGmailClient } from './gmailPayableAuth.js';
 import {
   getLastHistoryId,
   setLastHistoryId,
-  hasProcessedAlconMessageId,
-  addProcessedAlconMessageId
+  hasProcessedArtmostMessageId,
+  addProcessedArtmostMessageId
 } from './gmailHistoryState.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { parseArtmostInvoicePdf } from './artmostPdfParser.js';
-import { ensureArtmostAccPayAndAttach } from './xeroArtmostBills.js';
+import {
+  ensureArtmostAccPayAndAttach,
+  ensureArtmostSupplierCreditAndAttach
+} from './xeroArtmostBills.js';
 import {
   bufferLooksLikePdf,
   collectPdfAttachmentsFromPayload
@@ -172,11 +175,16 @@ export async function processArtmostGmailMessage(gmail, messageId, userEmail) {
 
     for (const inv of parsed.invoices) {
       try {
-        await ensureArtmostAccPayAndAttach({
+        const opts = {
           fields: inv.fields,
           pagePdfBuffer: buffer,
           attachmentFileName: filename
-        });
+        };
+        if (inv.fields?.documentKind === 'supplier_credit_note') {
+          await ensureArtmostSupplierCreditAndAttach(opts);
+        } else {
+          await ensureArtmostAccPayAndAttach(opts);
+        }
       } catch (err) {
         hadFailure = true;
         console.error(
@@ -186,6 +194,7 @@ export async function processArtmostGmailMessage(gmail, messageId, userEmail) {
             attachmentFilename: filename,
             page: inv.page,
             invoiceNumber: inv.fields?.invoiceNumber || null,
+            documentKind: inv.fields?.documentKind || 'supplier_invoice',
             matchedEntity: inv.fields?.matchedEntity || null,
             error: err instanceof Error ? err.message : String(err),
             xero: err?.response?.data || null
@@ -226,7 +235,7 @@ export async function runArtmostGmailPipeline(parsed) {
 
   let batchFailed = false;
   for (const id of messageIds) {
-    if (await hasProcessedAlconMessageId(userEmail, id)) continue;
+    if (await hasProcessedArtmostMessageId(userEmail, id)) continue;
     try {
       const outcome = await processArtmostGmailMessage(gmail, id, userEmail);
       if (outcome === 'failed') {
@@ -234,12 +243,12 @@ export async function runArtmostGmailPipeline(parsed) {
         continue;
       }
       if (outcome === 'success' || outcome === 'orphan') {
-        await addProcessedAlconMessageId(userEmail, id);
+        await addProcessedArtmostMessageId(userEmail, id);
       }
     } catch (err) {
       if (isGmailRequestedEntityNotFound(err)) {
         console.warn('[Artmost] message 건너뜀 (Gmail 404)', id);
-        await addProcessedAlconMessageId(userEmail, id);
+        await addProcessedArtmostMessageId(userEmail, id);
         continue;
       }
       batchFailed = true;
