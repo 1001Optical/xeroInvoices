@@ -210,19 +210,15 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
     return true;
   }
   if (!DAILY_COMBINED_SUBJECT.test(subjEarly)) {
-    console.warn(
-      '[Hoya] 스킵 — HOYA 발신(axd365au@hoya.com)인데 제목이 Daily Combined Invoice 가 아님',
-      JSON.stringify({
-        messageId,
-        subject: subjEarly.slice(0, 280)
-      })
-    );
     return true;
   }
 
   const pdfs = collectPdfAttachmentsFromPayload(full.data.payload);
   if (pdfs.length === 0) {
-    console.warn('[Hoya] PDF 첨부 없음 messageId=', messageId);
+    console.warn(
+      '[Hoya] Daily Combined 예상인데 PDF 없음 — 재시도 messageId=',
+      messageId
+    );
     return false;
   }
 

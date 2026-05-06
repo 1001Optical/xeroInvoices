@@ -11,8 +11,10 @@
  *   HOYA_XERO_DEBUG_ATTACH_PUT=1 → PUT 직전 비교용 한 줄 (tenantId, invoiceId, tokenFpSha256_12)
  *   HOYA_XERO_DEBUG_ATTACH_PUT_VERBOSE=1 → 위 + 상세 JSON
  *   HOYA_XERO_DEBUG_ORG=1 → 같은 토큰·테넌트로 GET Organisation 스냅샷 (권한/조직 비교용)
- *   HOYA_XERO_FIND_INVOICE_RETRIES=8 (기본, 최대 12) → find ACCPAY/크레딧 시 429·503 재시도
- *   HOYA_XERO_MIN_REQUEST_INTERVAL_MS=280 (기본) → api.xro/2.0 호출 사이 최소 간격 (429 완화)
+ *   HOYA_XERO_API_RETRIES=6 (기본, 최대 10) → Xero 429·503 공통 재시도
+ *   HOYA_XERO_FIND_INVOICE_RETRIES=8 (기본, 최대 12) → find ACCPAY/크레딧 시 추가 429·503 재시도
+ *   HOYA_XERO_MIN_REQUEST_INTERVAL_MS=1200 (기본) → api.xro/2.0 호출 사이 최소 간격 (Xero 분당 제한 완화)
+ *   HOYA_XERO_CONNECTIONS_CACHE_MS=600000 (기본) → GET /connections 확인 캐시
  *   HOYA_XERO_RATE_LIMIT_DISABLED=1 → 위 간격·직렬 게이트 끄기 (디버그용)
  */
 import axios from 'axios';
@@ -75,9 +77,19 @@ function hoyaXeroAccountingRateLimitEnabled() {
 }
 
 function hoyaXeroMinRequestIntervalMs() {
-  const n = Number(process.env.HOYA_XERO_MIN_REQUEST_INTERVAL_MS ?? 280);
-  if (!Number.isFinite(n) || n < 0) return 280;
+  const n = Number(process.env.HOYA_XERO_MIN_REQUEST_INTERVAL_MS ?? 1200);
+  if (!Number.isFinite(n) || n < 0) return 1200;
   return Math.min(10_000, n);
+}
+
+function hoyaXeroApiRetries() {
+  const n = Number(process.env.HOYA_XERO_API_RETRIES ?? 6);
+  if (!Number.isFinite(n) || n < 0) return 6;
+  return Math.min(10, Math.floor(n));
+}
+
+function isHoyaXeroRetryableStatus(status) {
+  return status === 429 || status === 503;
 }
 
 function isHoyaXeroAccountingApiUrl(url) {
@@ -114,11 +126,39 @@ hoyaXeroHttp.interceptors.response.use(
     hoyaXeroAccountingReleaseGate(r.config);
     return r;
   },
-  (err) => {
+  async (err) => {
     hoyaXeroAccountingReleaseGate(err.config);
     const st = err.response?.status;
     const u = err.config?.url;
     const d = err.response?.data?.Detail || err.response?.data?.Title;
+    if (
+      err.config &&
+      isHoyaXeroAccountingApiUrl(u) &&
+      isHoyaXeroRetryableStatus(st)
+    ) {
+      const attempt = Number(err.config.__hoyaXeroRetryAttempt || 0);
+      const maxRetries = hoyaXeroApiRetries();
+      if (attempt < maxRetries) {
+        err.config.__hoyaXeroRetryAttempt = attempt + 1;
+        delete err.config.__hoyaAccountingGateRelease;
+        const fallback = Math.min(60_000, 1_000 * 2 ** attempt);
+        const waitMs = xeroRetryWaitMs(err, fallback);
+        console.warn('[Hoya Xero] API 재시도', {
+          method: String(err.config.method || 'GET').toUpperCase(),
+          status: st,
+          attempt: attempt + 1,
+          maxRetries,
+          waitMs,
+          url: String(u || '').replace(API, '/api.xro/2.0'),
+          retryAfterHeader:
+            err.response?.headers?.['retry-after'] ??
+            err.response?.headers?.['Retry-After'] ??
+            null
+        });
+        await sleep(waitMs);
+        return hoyaXeroHttp.request(err.config);
+      }
+    }
     if (st === 401 && u) {
       const isAtt = /\/Attachments\//i.test(String(u));
       if (isAtt) {
@@ -140,19 +180,61 @@ hoyaXeroHttp.interceptors.response.use(
 const DEFAULT_HOYA_CONTACT_NAME = 'HOYA LENS AUSTRALIA PTY. LIMITED';
 
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections';
+const xeroConnectionsVerifyCache = new Map();
+
+function xeroConnectionsCacheTtlMs() {
+  const n = Number(process.env.HOYA_XERO_CONNECTIONS_CACHE_MS ?? 600_000);
+  if (!Number.isFinite(n) || n < 0) return 600_000;
+  return Math.min(3_600_000, n);
+}
+
+async function getXeroConnectionsWithRetry(accessToken) {
+  let lastErr;
+  const maxRetries = hoyaXeroApiRetries();
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await axios.get(XERO_CONNECTIONS_URL, {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: 'application/json'
+        },
+        validateStatus: () => true
+      });
+    } catch (err) {
+      lastErr = err;
+      const st = err.response?.status;
+      if (!isHoyaXeroRetryableStatus(st) || attempt >= maxRetries) {
+        throw err;
+      }
+      const fallback = Math.min(60_000, 1_000 * 2 ** attempt);
+      const waitMs = xeroRetryWaitMs(err, fallback);
+      console.warn('[Hoya Xero] /connections 재시도', {
+        status: st,
+        attempt: attempt + 1,
+        maxRetries,
+        waitMs,
+        retryAfterHeader:
+          err.response?.headers?.['retry-after'] ??
+          err.response?.headers?.['Retry-After'] ??
+          null
+      });
+      await sleep(waitMs);
+    }
+  }
+  throw lastErr;
+}
 
 /**
  * Accounting 호출 전에 동일 access token 으로 GET /connections — Postman 과 동일하게 붙는지 확인
  * (기본 axios: 401 시 hoyaXeroHttp 인터셉터와 무관하게 본문 처리)
  */
 async function verifyXeroConnectionsBeforeAccounting(accessToken, expectedTenantId) {
-  const res = await axios.get(XERO_CONNECTIONS_URL, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: 'application/json'
-    },
-    validateStatus: () => true
-  });
+  const fp = xeroAccessTokenFingerprint(accessToken);
+  const cacheKey = `${fp.sha256_12}|${expectedTenantId}`;
+  const cachedUntil = xeroConnectionsVerifyCache.get(cacheKey) || 0;
+  if (cachedUntil > Date.now()) return;
+
+  const res = await getXeroConnectionsWithRetry(accessToken);
 
   if (res.status >= 400) {
     const body =
@@ -184,6 +266,8 @@ async function verifyXeroConnectionsBeforeAccounting(accessToken, expectedTenant
       '[Hoya Xero] /connections: 이 토큰의 연결 목록에 Xero-tenant-id 가 없음 — tenant·토큰 출처 불일치 가능'
     );
   }
+
+  xeroConnectionsVerifyCache.set(cacheKey, Date.now() + xeroConnectionsCacheTtlMs());
 }
 
 /**
@@ -751,9 +835,14 @@ function xeroRetryWaitMs(err, fallbackMs) {
   try {
     const h = err.response?.headers?.['retry-after'] ?? err.response?.headers?.['Retry-After'];
     if (h == null || h === '') return fallbackMs;
-    const sec = parseInt(String(h).trim(), 10);
+    const raw = String(h).trim();
+    const sec = parseInt(raw, 10);
     if (Number.isFinite(sec) && sec > 0) {
       return Math.min(120_000, sec * 1000);
+    }
+    const at = Date.parse(raw);
+    if (Number.isFinite(at)) {
+      return Math.min(120_000, Math.max(0, at - Date.now()));
     }
   } catch {
     /* ignore */

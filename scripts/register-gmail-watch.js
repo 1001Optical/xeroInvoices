@@ -4,7 +4,8 @@
  *
  * 사용: npm run gmail:watch
  * 필요 env: PAYABLE_GMAIL_CLIENT_ID, PAYABLE_GMAIL_CLIENT_SECRET, PAYABLE_GMAIL_REFRESH_TOKEN, PAYABLE_SUBPUB
- * 선택: PAYABLE_GMAIL_WATCH_LABEL_IDS (쉼표구분, 기본 INBOX)
+ * 선택: PAYABLE_GMAIL_WATCH_LABEL_IDS (쉼표구분 label ID)
+ *   미설정 시 전체 메일함 watch. INBOX 로 제한하면 자동 분류/보관된 공급사 인보이스가 Pub/Sub 대상에서 빠질 수 있음.
  */
 import dotenv from 'dotenv';
 import { google } from 'googleapis';
@@ -27,7 +28,7 @@ const labelIds = process.env.PAYABLE_GMAIL_WATCH_LABEL_IDS
   ? process.env.PAYABLE_GMAIL_WATCH_LABEL_IDS.split(',')
       .map((s) => s.trim())
       .filter(Boolean)
-  : ['INBOX'];
+  : [];
 
 const auth = new google.auth.OAuth2(clientId, clientSecret);
 auth.setCredentials({ refresh_token: refreshToken });
@@ -39,7 +40,7 @@ async function watch() {
     userId: 'me',
     requestBody: {
       topicName,
-      labelIds
+      ...(labelIds.length > 0 ? { labelIds } : {})
     }
   });
 
