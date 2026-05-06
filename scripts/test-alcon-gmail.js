@@ -3,7 +3,7 @@
  * Alcon TAX INVOICE 메일 — Gmail 검색·PDF inspect·파싱, run 시 Xero 업로드
  * PDF는 파일당 1페이지가 기본.
  *
- *   node scripts/test-alcon-gmail.js list
+ *   node scripts/test-alcon-gmail.js list  (--date 생략 시 Australia/Sydney 기준 "어제")
  *   node scripts/test-alcon-gmail.js list --q 'from:my.accounts@alcon.com newer_than:7d'
  *   node scripts/test-alcon-gmail.js run <messageId>
  *   node scripts/test-alcon-gmail.js inspect <messageId> [--pdf N] [--out path.json] [--file-only]
@@ -20,6 +20,13 @@ import {
 import { processAlconGmailMessage } from '../1001server/utils/gmailAlconPipeline.js';
 import { inspectAlconPdfBuffer } from '../1001server/utils/alconPdfParser.js';
 import { initXeroTokenServiceEnvOnly } from '../1001server/utils/xero.js';
+import {
+  LIST_DAY_TIMEZONE,
+  PAD_ENV_KEYS,
+  gmailQueryDayRangeForList,
+  resolveAfterPadDays,
+  yesterdayYmdInSydney
+} from './gmailListSydneyRange.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
@@ -31,25 +38,6 @@ function usage() {
   node scripts/test-alcon-gmail.js run <messageId>
   node scripts/test-alcon-gmail.js inspect <messageId> [--pdf N] [--out path.json] [--file-only]
 `);
-}
-
-function gmailQueryForLocalDay(ymd) {
-  const [y, mo, da] = ymd.split('-').map((x) => parseInt(x, 10));
-  if (!y || !mo || !da) throw new Error(`날짜 형식: YYYY-MM-DD (${ymd})`);
-  const start = new Date(y, mo - 1, da);
-  const end = new Date(y, mo - 1, da + 1);
-  const fmt = (d) =>
-    `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
-  return `after:${fmt(start)} before:${fmt(end)}`;
-}
-
-function yesterdayLocalYmd() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
 }
 
 function parseArgs(argv) {
@@ -145,11 +133,14 @@ async function main() {
   console.log('Mailbox:', userEmail);
 
   if (args.cmd === 'list') {
-    const day = args.dateStr || yesterdayLocalYmd();
+    const day = args.dateStr || yesterdayYmdInSydney();
     const q =
       args.customQ ||
-      `from:my.accounts@alcon.com subject:"Your Alcon TAX INVOICE" ${gmailQueryForLocalDay(day)}`;
-    console.log('Query:', q);
+      `from:my.accounts@alcon.com subject:"Your Alcon TAX INVOICE" ${gmailQueryDayRangeForList(day, PAD_ENV_KEYS.alcon)}`;
+    console.log(
+      `Query (${LIST_DAY_TIMEZONE} 기준 날짜=${day}, after 패딩=${resolveAfterPadDays(PAD_ENV_KEYS.alcon)}일):`,
+      q
+    );
     const rows = await listMessages(gmail, q, args.max);
     if (rows.length === 0) {
       console.log('검색 결과 없음. --date 나 --q 로 범위를 넓혀 보세요.');

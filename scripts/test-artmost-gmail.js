@@ -2,7 +2,7 @@
 /**
  * Artmost 메일 — Gmail 검색·PDF inspect·파싱
  *
- *   node scripts/test-artmost-gmail.js list
+ *   node scripts/test-artmost-gmail.js list  (--date 생략 시 Australia/Sydney 기준 "어제")
  *   node scripts/test-artmost-gmail.js list --q 'from:admin@artmostgovau.com.au newer_than:7d'
  *   node scripts/test-artmost-gmail.js run <messageId>
  *   node scripts/test-artmost-gmail.js inspect <messageId> [--pdf N] [--out path.json] [--file-only]
@@ -18,6 +18,13 @@ import {
 } from '../1001server/utils/gmailHoyaPipeline.js';
 import { processArtmostGmailMessage } from '../1001server/utils/gmailArtmostPipeline.js';
 import { inspectArtmostPdfBuffer } from '../1001server/utils/artmostPdfParser.js';
+import {
+  LIST_DAY_TIMEZONE,
+  PAD_ENV_KEYS,
+  gmailQueryDayRangeForList,
+  resolveAfterPadDays,
+  yesterdayYmdInSydney
+} from './gmailListSydneyRange.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
@@ -29,25 +36,6 @@ function usage() {
   node scripts/test-artmost-gmail.js run <messageId>
   node scripts/test-artmost-gmail.js inspect <messageId> [--pdf N] [--out path.json] [--file-only]
 `);
-}
-
-function gmailQueryForLocalDay(ymd) {
-  const [y, mo, da] = ymd.split('-').map((x) => parseInt(x, 10));
-  if (!y || !mo || !da) throw new Error(`날짜 형식: YYYY-MM-DD (${ymd})`);
-  const start = new Date(y, mo - 1, da);
-  const end = new Date(y, mo - 1, da + 1);
-  const fmt = (d) =>
-    `${d.getFullYear()}/${String(d.getMonth() + 1).padStart(2, '0')}/${String(d.getDate()).padStart(2, '0')}`;
-  return `after:${fmt(start)} before:${fmt(end)}`;
-}
-
-function yesterdayLocalYmd() {
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
 }
 
 function parseArgs(argv) {
@@ -140,17 +128,23 @@ async function main() {
     console.error('Gmail 프로필에 emailAddress 없음');
     process.exit(1);
   }
+  console.log('Mailbox:', userEmail);
 
   if (args.cmd === 'list') {
-    const day = args.dateStr || yesterdayLocalYmd();
+    const day = args.dateStr || yesterdayYmdInSydney();
     const q =
       args.customQ ||
-      `from:admin@artmostgovau.com.au subject:"Your ArtMost GOV Contact Lenses Australia order" ${gmailQueryForLocalDay(day)}`;
+      `from:admin@artmostgovau.com.au subject:"Your ArtMost GOV Contact Lenses Australia order" ${gmailQueryDayRangeForList(day, PAD_ENV_KEYS.artmost)}`;
+    console.log(
+      `Query (${LIST_DAY_TIMEZONE} 기준 날짜=${day}, after 패딩=${resolveAfterPadDays(PAD_ENV_KEYS.artmost)}일):`,
+      q
+    );
     const rows = await listMessages(gmail, q, args.max);
     if (rows.length === 0) {
       console.log('검색 결과 없음. --date 나 --q 로 범위를 넓혀 보세요.');
       return;
     }
+    console.log('\nID\tSubject\tDate');
     for (const r of rows) {
       console.log(`${r.id}\t${r.subject}\t${r.date}`);
     }

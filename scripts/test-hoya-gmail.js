@@ -39,6 +39,13 @@ import {
 } from '../1001server/utils/gmailHoyaPipeline.js';
 import { inspectHoyaPdfBuffer } from '../1001server/utils/hoyaPdfParser.js';
 import { initXeroTokenService, initXeroTokenServiceEnvOnly } from '../1001server/utils/xero.js';
+import {
+  LIST_DAY_TIMEZONE,
+  PAD_ENV_KEYS,
+  gmailQueryDayRangeForList,
+  resolveAfterPadDays,
+  yesterdayYmdInSydney
+} from './gmailListSydneyRange.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.join(__dirname, '..');
@@ -158,53 +165,6 @@ async function dumpGmailMessagePayload(gmail, messageId) {
   console.log(
     '※ 웹에서 PDF가 두 개인데 attachment·첨부 후보가 1이면, 두 번째는 MIME 첨부가 아니라 미리보기·ZIP·다른 메일일 수 있음.'
   );
-}
-
-/** list 검색 기준 타임존 — 웹에서 보는 호주 업무일과 맞추기 */
-const LIST_DAY_TIMEZONE = 'Australia/Sydney';
-
-/** 그레고리력 ±delta 일 (서버 TZ 무관) */
-function calendarShiftDays(y, m, d, deltaDays) {
-  const dt = new Date(Date.UTC(y, m - 1, d));
-  dt.setUTCDate(dt.getUTCDate() + deltaDays);
-  return {
-    y: dt.getUTCFullYear(),
-    mo: dt.getUTCMonth() + 1,
-    d: dt.getUTCDate()
-  };
-}
-
-function slashYmd(parts) {
-  const { y, mo, d } = parts;
-  return `${y}/${String(mo).padStart(2, '0')}/${String(d).padStart(2, '0')}`;
-}
-
-/**
- * --date YYYY-MM-DD 를 "그날 받은 메일"로 검색할 때 Gmail 의 after:/before: 해석(계정·UTC) 때문에
- * 시드니 새벽 메일이 하루 밀려 나오는 경우가 있어 after 만 HOYA_GMAIL_LIST_AFTER_PAD_DAYS 만큼 앞당김 (기본 1일).
- */
-function gmailQueryDayRangeForList(ymd) {
-  const [y, mo, da] = ymd.split('-').map((x) => parseInt(x, 10));
-  if (!y || !mo || !da) throw new Error(`날짜 형식: YYYY-MM-DD (${ymd})`);
-  const padAfter = Math.max(
-    0,
-    Math.min(5, Number(process.env.HOYA_GMAIL_LIST_AFTER_PAD_DAYS ?? 1))
-  );
-  const afterStart = calendarShiftDays(y, mo, da, -padAfter);
-  const beforeExclusive = calendarShiftDays(y, mo, da, 1);
-  return `after:${slashYmd(afterStart)} before:${slashYmd(beforeExclusive)}`;
-}
-
-function yesterdayYmdInListTimezone() {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: LIST_DAY_TIMEZONE,
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit'
-  }).formatToParts(new Date());
-  const g = (t) => parseInt(parts.find((p) => p.type === t)?.value || '0', 10);
-  const prev = calendarShiftDays(g('year'), g('month'), g('day'), -1);
-  return `${prev.y}-${String(prev.mo).padStart(2, '0')}-${String(prev.d).padStart(2, '0')}`;
 }
 
 /** 내부 토큰 URL이 이 PC가 아닌 호스트를 가리키는지 (원격이면 그 서버의 env 가 따로 필요함) */
@@ -327,13 +287,16 @@ async function main() {
   console.log('Mailbox:', userEmail);
 
   if (args.cmd === 'list') {
-    const day = args.dateStr || yesterdayYmdInListTimezone();
+    const day = args.dateStr || yesterdayYmdInSydney();
     const base = args.looseList
       ? 'from:axd365au@hoya.com'
       : 'from:axd365au@hoya.com subject:"Daily Combined Invoice"';
-    const range = gmailQueryDayRangeForList(day);
+    const range = gmailQueryDayRangeForList(day, PAD_ENV_KEYS.hoya);
     const q = args.customQ || `${base} ${range}`;
-    console.log(`Query (${LIST_DAY_TIMEZONE} 기준 날짜=${day}, after 패딩=${process.env.HOYA_GMAIL_LIST_AFTER_PAD_DAYS ?? 1}일):`, q);
+    console.log(
+      `Query (${LIST_DAY_TIMEZONE} 기준 날짜=${day}, after 패딩=${resolveAfterPadDays(PAD_ENV_KEYS.hoya)}일):`,
+      q
+    );
     if (args.looseList && !args.customQ) {
       console.log(
         '(제목 필터 없음 — Daily Combined 가 아닌 제목의 Hoya 메일도 포함. 파이프라인 run 은 제목·발신 검사 있음.)'
