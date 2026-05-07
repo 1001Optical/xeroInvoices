@@ -35,6 +35,18 @@ export const rootEndpointsDocumentation = {
   gmailPubSubHealth: {
     method: 'GET',
     path: '/webhooks/gmail/health',
-    note: '푸시 수신 라우트 헬스체크'
+    note: '푸시 수신 라우트 헬스체크; watchRenewConfigured 는 GMAIL_WATCH_RENEW_TOKEN 설정 여부'
+  },
+  gmailWatchRenew: {
+    method: 'GET or POST',
+    path: '/webhooks/gmail/renew-watch',
+    query: {
+      token: '필수: GMAIL_WATCH_RENEW_TOKEN 과 동일 (env 미설정 시 503)'
+    },
+    headers: {
+      Authorization: '대안: Bearer <GMAIL_WATCH_RENEW_TOKEN>'
+    },
+    note:
+      'Gmail users.watch() 재등록 — Cloud Scheduler 예: 6일마다 GET 호출. Pub/Sub 토큰(GMAIL_PUBSUB_PUSH_TOKEN)과 별도 비밀 권장'
   }
 };
