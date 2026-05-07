@@ -93,8 +93,9 @@ async function main() {
 
   if (args.cmd === 'list') {
     const day = args.dateStr || yesterdayYmdInSydney();
+    /** gmailBauschPipeline 발신자와 동일 (자동 알림 + Phua 등) */
     const base =
-      'from:sap_generated_no_reply@bausch.com subject:"B&L Invoice"';
+      '(from:sap_generated_no_reply@bausch.com OR from:PengLee.Phua@bausch.com) subject:"B&L Invoice"';
     let rows;
     if (args.customQ) {
       rows = await listMessages(gmail, args.customQ, args.max);
