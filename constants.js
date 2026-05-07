@@ -4,6 +4,7 @@ export const BRANCHES = [
     name:'Blacktown',
     entity:'1001 Optical Pty Ltd',
     alconAccount:'100380150',
+    alconAccounts:['100380150', '100382123'],
     hoyaAccount:'015782',
     bashLombAccount:'306887'
   },

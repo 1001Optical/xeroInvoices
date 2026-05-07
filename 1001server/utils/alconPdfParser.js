@@ -126,7 +126,14 @@ function isAlconSupplierCreditFields({ netGoods, totalFreight, totalGst, total, 
 function matchBranchByAlconAccount(alconAccount) {
   const key = String(alconAccount || '').trim();
   if (!key) return null;
-  return BRANCHES.find((b) => String(b.alconAccount || '').trim() === key) || null;
+  return (
+    BRANCHES.find((b) => {
+      const primary = String(b.alconAccount || '').trim();
+      if (primary && primary === key) return true;
+      const aliases = Array.isArray(b.alconAccounts) ? b.alconAccounts : [];
+      return aliases.some((x) => String(x || '').trim() === key);
+    }) || null
+  );
 }
 
 function isMoneyToken(s) {
