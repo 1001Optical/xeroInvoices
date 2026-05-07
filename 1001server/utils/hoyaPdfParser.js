@@ -154,6 +154,7 @@ export async function parseHoyaCombinedPdf(buffer, options = {}) {
           rawText,
           referenceNumber: null,
           invoiceDate: null,
+          accountNo: null,
           soldTo: null,
           storeLine: null,
           lineItems: [],
@@ -215,6 +216,7 @@ function mergeHoyaParseAttempts(primary, secondary, tertiary) {
     ? parseHoyaInvoicePageText(normalizeExtractText(tertiary))
     : {
         lineItems: [],
+        accountNo: null,
         soldTo: null,
         storeLine: null,
         documentKind: 'supplier_invoice'
@@ -252,6 +254,7 @@ function mergeHoyaParseAttempts(primary, secondary, tertiary) {
   return {
     referenceNumber: a.referenceNumber || b.referenceNumber || c.referenceNumber,
     invoiceDate: a.invoiceDate || b.invoiceDate || c.invoiceDate,
+    accountNo: a.accountNo || b.accountNo || c.accountNo,
     soldTo: metaPick.soldTo || a.soldTo || b.soldTo || c.soldTo,
     storeLine: metaPick.storeLine || a.storeLine || b.storeLine || c.storeLine,
     lineItems: bestItems,
@@ -447,6 +450,22 @@ function extractInvoiceDate(normalized, flat) {
   return null;
 }
 
+function extractHoyaAccountNo(normalized, flat) {
+  const candidates = [normalized, flat];
+  const patterns = [
+    /\bAccount\s*No\.?\s*[\s\S]{0,80}?\b(\d{6})\b/i,
+    /\bSales\s*Order\s*No\.?\s+Account\s*No\.?\s+Reference[\s\S]{0,140}?\b(\d{6})\b/i,
+    /\bShip\s*To\s*Account\s*[\s\S]{0,60}?\b(\d{6})\b/i
+  ];
+  for (const hay of candidates) {
+    for (const re of patterns) {
+      const m = hay.match(re);
+      if (m?.[1]) return String(m[1]).trim();
+    }
+  }
+  return null;
+}
+
 /**
  * 한 페이지 텍스트에서 필드 추출 (레이아웃 차이에 대비해 여러 패턴 시도)
  * @param {string} text
@@ -458,6 +477,7 @@ export function parseHoyaInvoicePageText(text) {
   const referenceNumber = extractReferenceNumber(normalized, flat);
 
   let invoiceDate = extractInvoiceDate(normalized, flat);
+  const accountNo = extractHoyaAccountNo(normalized, flat);
 
   let soldTo = null;
   let storeLine = null;
@@ -543,6 +563,7 @@ export function parseHoyaInvoicePageText(text) {
   return {
     referenceNumber,
     invoiceDate,
+    accountNo,
     soldTo,
     storeLine,
     lineItems,

@@ -323,6 +323,7 @@ function resolveHoyaEntityName(opts, precomputedMatch) {
   const matched =
     precomputedMatch ??
     matchBranchFromHoyaPdf({
+      accountNo: opts?.accountNo,
       storeLine: opts?.storeLine,
       soldTo: opts?.soldTo,
       fullPageText: opts?.fullPageText
@@ -1194,6 +1195,7 @@ async function uploadInvoicePdfAttachment(
  * @param {{
  *   referenceNumber: string,
  *   invoiceDateStr: string,
+ *   accountNo?: string|null,
  *   storeLine?: string|null,
  *   soldTo?: string|null,
  *   entityName?: string,
@@ -1207,6 +1209,7 @@ export async function ensureHoyaAccPayAndAttach(opts) {
   const {
     referenceNumber,
     invoiceDateStr,
+    accountNo,
     storeLine,
     soldTo,
     fullPageText,
@@ -1222,12 +1225,13 @@ export async function ensureHoyaAccPayAndAttach(opts) {
     );
   }
 
-  const matched = matchBranchFromHoyaPdf({ storeLine, soldTo, fullPageText });
+  const matched = matchBranchFromHoyaPdf({ accountNo, storeLine, soldTo, fullPageText });
   const entityName = resolveHoyaEntityName(opts, matched);
   if (!matched && !opts.entityName) {
     console.warn('[Hoya Xero] BRANCHES 스토어 이름 매칭 실패 — 기본/HOYA_XERO_ENTITY 법인 사용', {
       storeLine: storeLine?.slice?.(0, 300),
       soldTo: soldTo?.slice?.(0, 300),
+      accountNo: accountNo || null,
       entityName
     });
   }
@@ -1396,6 +1400,7 @@ export async function ensureHoyaSupplierCreditAndAttach(opts) {
   const {
     referenceNumber,
     invoiceDateStr,
+    accountNo,
     storeLine,
     soldTo,
     fullPageText,
@@ -1411,12 +1416,13 @@ export async function ensureHoyaSupplierCreditAndAttach(opts) {
     );
   }
 
-  const matched = matchBranchFromHoyaPdf({ storeLine, soldTo, fullPageText });
+  const matched = matchBranchFromHoyaPdf({ accountNo, storeLine, soldTo, fullPageText });
   const entityName = resolveHoyaEntityName(opts, matched);
   if (!matched && !opts.entityName) {
     console.warn('[Hoya Xero] BRANCHES 스토어 이름 매칭 실패 — 기본/HOYA_XERO_ENTITY 법인 사용', {
       storeLine: storeLine?.slice?.(0, 300),
       soldTo: soldTo?.slice?.(0, 300),
+      accountNo: accountNo || null,
       entityName
     });
   }

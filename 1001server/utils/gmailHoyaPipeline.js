@@ -398,6 +398,7 @@ async function processOneMessage(gmail, messageId, userEmail, options = {}) {
       const xeroOpts = {
         referenceNumber: ref,
         invoiceDateStr: dt,
+        accountNo: inv.accountNo || null,
         soldTo: inv.soldTo,
         storeLine: inv.storeLine,
         fullPageText: inv.rawText,

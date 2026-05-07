@@ -1,5 +1,8 @@
 /**
- * PDF SOLD TO / 1001 … 줄에서 constants.js BRANCHES 와 매칭 → Xero 법인(entity) 문자열
+ * Hoya PDF 매칭:
+ * 1) Account No. (hoyaAccount) 우선
+ * 2) SOLD TO / 1001 … 이름·별칭 텍스트 매칭
+ * → Xero 법인(entity) 문자열
  * - name 포함 여부
  * - invoiceAliases(선택) — Online → "1001 OPTICAL CENTRAL DISTRIBUTION" 등 인보이스 전용 문구
  */
@@ -28,10 +31,19 @@ function sortedBranchNeedles() {
 const NEEDLES = sortedBranchNeedles();
 
 /**
- * @param {{ storeLine?: string|null, soldTo?: string|null, fullPageText?: string|null }} fields
+ * @param {{ storeLine?: string|null, soldTo?: string|null, fullPageText?: string|null, accountNo?: string|null }} fields
  *   fullPageText — SOLD TO 블록만 잡히면 'Account' 등 오탐일 때, 페이지 전체에서 1001… 문구 매칭용
  */
 export function matchBranchFromHoyaPdf(fields) {
+  const accountNo = String(fields?.accountNo || '').trim();
+  if (accountNo) {
+    const byAccount = BRANCHES.find((b) => String(b.hoyaAccount || '').trim() === accountNo);
+    if (byAccount) {
+      const entityName = byAccount.entity || byAccount.bankEntity;
+      if (entityName) return { branch: byAccount, entityName };
+    }
+  }
+
   const hay = [fields?.storeLine, fields?.soldTo, fields?.fullPageText]
     .filter((x) => x != null && String(x).trim() !== '')
     .join('\n')
