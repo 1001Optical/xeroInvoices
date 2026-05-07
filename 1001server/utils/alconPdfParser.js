@@ -5,7 +5,7 @@
  */
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist/legacy/build/pdf.mjs';
 import { createRequire } from 'module';
-import { BRANCHES } from '../../constants.js';
+import { BRANCHES, xeroExpenseAccountCodeCl } from '../../constants.js';
 
 const require = createRequire(import.meta.url);
 GlobalWorkerOptions.workerSrc = require.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
@@ -82,7 +82,8 @@ function parseMoneyAud(s) {
 }
 
 function alconExpenseAccountCode() {
-  return String(process.env.ALCON_XERO_EXPENSE_ACCOUNT_CODE || '10075303').trim();
+  const c = process.env.ALCON_XERO_EXPENSE_ACCOUNT_CODE;
+  return String((c && c.trim()) || xeroExpenseAccountCodeCl()).trim();
 }
 
 function alconFreightAccountCode() {

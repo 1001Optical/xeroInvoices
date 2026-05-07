@@ -11,12 +11,15 @@ import {
   addProcessedMessageId,
   hasProcessedArtmostMessageId,
   addProcessedArtmostMessageId,
+  hasProcessedBauschMessageId,
+  addProcessedBauschMessageId,
   hasProcessedAlconMessageId,
   addProcessedAlconMessageId
 } from './gmailHistoryState.js';
 import { collectMessageIdsSinceHistoryForPayables } from './gmailPayableHistorySync.js';
 import { processHoyaGmailMessage } from './gmailHoyaPipeline.js';
 import { processArtmostGmailMessage } from './gmailArtmostPipeline.js';
+import { processBauschGmailMessage } from './gmailBauschPipeline.js';
 import { processAlconGmailMessage } from './gmailAlconPipeline.js';
 import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
@@ -73,7 +76,7 @@ export function parsePubSubGmailNotification(body) {
 }
 
 /**
- * Artmost + Alcon + Hoya Payable 인보이스: history 한 번 조회 후 메일마다 Artmost → Alcon → Hoya 순 처리, historyId 는 배치 전부 성공 시에만 갱신
+ * Artmost + Bausch + Alcon + Hoya Payable 인보이스: history 한 번 조회 후 메일마다 순차 처리, historyId 는 배치 전부 성공 시에만 갱신
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export async function runPayableGmailPipelines(parsed) {
@@ -132,6 +135,15 @@ export async function runPayableGmailPipelines(parsed) {
         }
       }
 
+      if (!(await hasProcessedBauschMessageId(userEmail, id))) {
+        const bauschOutcome = await processBauschGmailMessage(gmail, id, userEmail);
+        if (bauschOutcome === 'failed') {
+          batchFailed = true;
+        } else if (bauschOutcome === 'success' || bauschOutcome === 'orphan') {
+          await addProcessedBauschMessageId(userEmail, id);
+        }
+      }
+
       if (!(await hasProcessedMessageId(userEmail, id))) {
         const hoyaOk = await processHoyaGmailMessage(gmail, id, userEmail);
         if (!hoyaOk) {
@@ -146,6 +158,7 @@ export async function runPayableGmailPipelines(parsed) {
         await addProcessedMessageId(userEmail, id);
         await addProcessedArtmostMessageId(userEmail, id);
         await addProcessedAlconMessageId(userEmail, id);
+        await addProcessedBauschMessageId(userEmail, id);
         continue;
       }
       const msg = err instanceof Error ? err.message : String(err);
@@ -166,7 +179,7 @@ export async function runPayableGmailPipelines(parsed) {
 }
 
 /**
- * Pub/Sub 푸시 — Artmost·Alcon·Hoya Payable 파이프라인 (비동기 시작)
+ * Pub/Sub 푸시 — Artmost·Bausch·Alcon·Hoya Payable 파이프라인 (비동기 시작)
  * @param {object} parsed parsePubSubGmailNotification 결과
  */
 export function onGmailPubSubNotification(parsed) {

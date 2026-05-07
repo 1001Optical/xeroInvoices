@@ -26,6 +26,7 @@ import {
   DEFAULT_ENTITY
 } from './xero.js';
 import { matchBranchFromHoyaPdf } from './hoyaBranchMatch.js';
+import { xeroExpenseAccountCodeHoya } from '../../constants.js';
 
 const API = 'https://api.xero.com/api.xro/2.0';
 const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
@@ -335,7 +336,7 @@ function resolveHoyaEntityName(opts, precomputedMatch) {
 
 function expenseAccountCode() {
   const c = process.env.HOYA_XERO_EXPENSE_ACCOUNT_CODE;
-  return (c && String(c).trim()) || '51103';
+  return (c && String(c).trim()) || xeroExpenseAccountCodeHoya();
 }
 
 /**

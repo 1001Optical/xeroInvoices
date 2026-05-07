@@ -1,6 +1,6 @@
 /**
- * Gmail history.list 로 신규 messageId 수집 (Hoya·Artmost·Alcon 등 Payable 인보이스 공통)
- * startHistoryId 404 시 최근 발신 메일로 대체 (Hoya + Artmost + Alcon 발신자)
+ * Gmail history.list 로 신규 messageId 수집 (Hoya·Artmost·Alcon·Bausch 등 Payable 인보이스 공통)
+ * startHistoryId 404 시 최근 발신 메일로 대체 (Hoya + Artmost + Alcon + Bausch 발신자)
  */
 
 /**
@@ -38,7 +38,7 @@ export async function collectMessageIdsSinceHistoryForPayables(
       const status = e.response?.status || e.code;
       if (status === 404) {
         console.warn(
-          '[Gmail Payables] history 404 — 최근 Hoya/Artmost/Alcon 메일로 대체 조회',
+          '[Gmail Payables] history 404 — 최근 Hoya/Artmost/Alcon/Bausch 메일로 대체 조회',
           userEmail
         );
         await listRecentPayableVendorFallback(gmail, messageIds);
@@ -57,7 +57,7 @@ async function listRecentPayableVendorFallback(gmail, ids) {
   const res = await gmail.users.messages.list({
     userId: 'me',
     q:
-      '(from:axd365au@hoya.com OR from:admin@artmostgovau.com.au OR from:my.accounts@alcon.com) newer_than:14d',
+      '(from:axd365au@hoya.com OR from:admin@artmostgovau.com.au OR from:my.accounts@alcon.com OR from:sap_generated_no_reply@bausch.com) newer_than:14d',
     maxResults: 40
   });
   for (const m of res.data.messages || []) {

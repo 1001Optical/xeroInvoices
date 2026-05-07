@@ -2,7 +2,7 @@
 /**
  * Hoya Daily Combined 메일을 Gmail API로 찾아서 파이프라인(파싱 + Xero) 실행
  *
- * 목록 (기본 "어제": Australia/Sydney 달력; Gmail after:/before: 와 시차 보정용 HOYA_GMAIL_LIST_AFTER_PAD_DAYS 기본 1):
+ * 목록 (기본 "어제": Australia/Sydney 달력; Gmail internalDate 로 시드니 하루만 필터):
  *   node scripts/test-hoya-gmail.js list
  *   node scripts/test-hoya-gmail.js list --q 'from:axd365au@hoya.com newer_than:2d'
  *   node scripts/test-hoya-gmail.js list --date 2026-04-14
@@ -41,9 +41,7 @@ import { inspectHoyaPdfBuffer } from '../1001server/utils/hoyaPdfParser.js';
 import { initXeroTokenService, initXeroTokenServiceEnvOnly } from '../1001server/utils/xero.js';
 import {
   LIST_DAY_TIMEZONE,
-  PAD_ENV_KEYS,
-  gmailQueryDayRangeForList,
-  resolveAfterPadDays,
+  listMessagesForSydneyCalendarDay,
   yesterdayYmdInSydney
 } from './gmailListSydneyRange.js';
 
@@ -291,26 +289,33 @@ async function main() {
     const base = args.looseList
       ? 'from:axd365au@hoya.com'
       : 'from:axd365au@hoya.com subject:"Daily Combined Invoice"';
-    const range = gmailQueryDayRangeForList(day, PAD_ENV_KEYS.hoya);
-    const q = args.customQ || `${base} ${range}`;
-    console.log(
-      `Query (${LIST_DAY_TIMEZONE} 기준 날짜=${day}, after 패딩=${resolveAfterPadDays(PAD_ENV_KEYS.hoya)}일):`,
-      q
-    );
+    let rows;
+    if (args.customQ) {
+      rows = await listMessages(gmail, args.customQ, args.max);
+      console.log('Query (--q):', args.customQ);
+    } else {
+      const result = await listMessagesForSydneyCalendarDay(gmail, {
+        baseQuery: base,
+        ymd: day,
+        maxResults: args.max
+      });
+      rows = result.rows;
+      console.log(
+        `${LIST_DAY_TIMEZONE} 달력 ${day} → Gmail internalDate 구간 [${new Date(result.startMs).toISOString()}, ${new Date(result.endMs).toISOString()})`
+      );
+      console.log('Gmail 검색 q (후보):', result.q);
+    }
     if (args.looseList && !args.customQ) {
       console.log(
         '(제목 필터 없음 — Daily Combined 가 아닌 제목의 Hoya 메일도 포함. 파이프라인 run 은 제목·발신 검사 있음.)'
       );
     }
-    const rows = await listMessages(gmail, q, args.max);
     if (rows.length === 0) {
       console.log(
-        '검색 결과 없음. Gmail 의 after:/before: 가 계정 시간대·UTC 와 어긋나면 시드니 새벽 메일이 빠질 수 있음.'
+        '검색 결과 없음. --date 변경 또는 --q 로 범위를 넓혀 보세요.'
       );
       console.log(
-        '시도: HOYA_GMAIL_LIST_AFTER_PAD_DAYS=2 node scripts/test-hoya-gmail.js list --date',
-        day,
-        '| 또는 --date 하루 전후 | 또는 --loose / --q \'from:axd365au@hoya.com newer_than:7d\''
+        '예: node scripts/test-hoya-gmail.js list --loose | 또는 --q \'from:axd365au@hoya.com newer_than:7d\''
       );
       return;
     }

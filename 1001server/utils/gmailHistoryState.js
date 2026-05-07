@@ -17,6 +17,7 @@ const MAX_INVOICE_KEYS = Number(process.env.GMAIL_MAX_STORED_INVOICE_KEYS || 100
  *   lastHistoryId?: string,
  *   processedMessageIds?: string[],
  *   processedArtmostMessageIds?: string[],
+ *   processedBauschMessageIds?: string[],
  *   processedAlconMessageIds?: string[],
  *   processedInvoiceKeys?: string[]
  * }} MailboxState
@@ -108,6 +109,24 @@ export async function addProcessedArtmostMessageId(userEmail, messageId) {
   const id = String(messageId);
   if (!list.includes(id)) list.push(id);
   cur.processedArtmostMessageIds = trimIdList(list, MAX_MESSAGE_IDS);
+  s[userEmail] = cur;
+  await saveHistoryState(s);
+}
+
+export async function hasProcessedBauschMessageId(userEmail, messageId) {
+  const s = await loadHistoryState();
+  const list = s[userEmail]?.processedBauschMessageIds || [];
+  return list.includes(String(messageId));
+}
+
+/** Bausch 메일 단위 처리 완료 후에만 호출 */
+export async function addProcessedBauschMessageId(userEmail, messageId) {
+  const s = await loadHistoryState();
+  const cur = s[userEmail] || {};
+  const list = [...(cur.processedBauschMessageIds || [])];
+  const id = String(messageId);
+  if (!list.includes(id)) list.push(id);
+  cur.processedBauschMessageIds = trimIdList(list, MAX_MESSAGE_IDS);
   s[userEmail] = cur;
   await saveHistoryState(s);
 }

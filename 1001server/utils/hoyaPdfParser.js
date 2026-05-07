@@ -519,6 +519,25 @@ export function parseHoyaInvoicePageText(text) {
     if (cn.length > 0) lineItems = cn;
   }
 
+  /**
+   * PRODUCT DESCRIPTION 없이 한 줄에만 나오는 요금·배송 라인
+   * 예: "Delivery Charge - April 2026 1 12.00 1.20 13.20"
+   * extractProductLineItems 는 PRODUCT DESCRIPTION 앵커가 없으면 [] → Xero 0원 폴백 라인만 들어가던 케이스
+   */
+  if (!isCredit && lineItems.length === 0) {
+    const standalone = parseHoyaLensRowsTrailingFourNumbers(normalized);
+    if (standalone.length > 0) {
+      const seen = new Set();
+      lineItems = [];
+      for (const r of standalone) {
+        const k = `${r.description}|${r.qty}|${r.price}|${r.gst}|${r.amount}`;
+        if (seen.has(k)) continue;
+        seen.add(k);
+        lineItems.push(r);
+      }
+    }
+  }
+
   const documentKind = isCredit ? 'supplier_credit_note' : 'supplier_invoice';
 
   return {

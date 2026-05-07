@@ -22,9 +22,7 @@ import { inspectAlconPdfBuffer } from '../1001server/utils/alconPdfParser.js';
 import { initXeroTokenServiceEnvOnly } from '../1001server/utils/xero.js';
 import {
   LIST_DAY_TIMEZONE,
-  PAD_ENV_KEYS,
-  gmailQueryDayRangeForList,
-  resolveAfterPadDays,
+  listMessagesForSydneyCalendarDay,
   yesterdayYmdInSydney
 } from './gmailListSydneyRange.js';
 
@@ -134,14 +132,23 @@ async function main() {
 
   if (args.cmd === 'list') {
     const day = args.dateStr || yesterdayYmdInSydney();
-    const q =
-      args.customQ ||
-      `from:my.accounts@alcon.com subject:"Your Alcon TAX INVOICE" ${gmailQueryDayRangeForList(day, PAD_ENV_KEYS.alcon)}`;
-    console.log(
-      `Query (${LIST_DAY_TIMEZONE} 기준 날짜=${day}, after 패딩=${resolveAfterPadDays(PAD_ENV_KEYS.alcon)}일):`,
-      q
-    );
-    const rows = await listMessages(gmail, q, args.max);
+    const base = 'from:my.accounts@alcon.com subject:"Your Alcon TAX INVOICE"';
+    let rows;
+    if (args.customQ) {
+      rows = await listMessages(gmail, args.customQ, args.max);
+      console.log('Query (--q):', args.customQ);
+    } else {
+      const result = await listMessagesForSydneyCalendarDay(gmail, {
+        baseQuery: base,
+        ymd: day,
+        maxResults: args.max
+      });
+      rows = result.rows;
+      console.log(
+        `${LIST_DAY_TIMEZONE} 달력 ${day} → Gmail internalDate 구간 [${new Date(result.startMs).toISOString()}, ${new Date(result.endMs).toISOString()})`
+      );
+      console.log('Gmail 검색 q (후보):', result.q);
+    }
     if (rows.length === 0) {
       console.log('검색 결과 없음. --date 나 --q 로 범위를 넓혀 보세요.');
       return;

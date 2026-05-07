@@ -1,4 +1,5 @@
 import axios from 'axios';
+import { xeroExpenseAccountCodeCl } from '../../constants.js';
 import { getAccessToken, getTenantIdForEntity } from './xero.js';
 
 const API = 'https://api.xero.com/api.xro/2.0';
@@ -18,11 +19,8 @@ function sanitizeAttachmentFileName(name) {
 }
 
 function artmostExpenseAccountCode() {
-  return String(
-    process.env.ARTMOST_XERO_EXPENSE_ACCOUNT_CODE ||
-      process.env.HOYA_XERO_EXPENSE_ACCOUNT_CODE ||
-      '51103'
-  ).trim();
+  const c = process.env.ARTMOST_XERO_EXPENSE_ACCOUNT_CODE;
+  return String((c && c.trim()) || xeroExpenseAccountCodeCl()).trim();
 }
 
 function artmostTrackingCategoryName() {
