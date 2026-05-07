@@ -17,7 +17,7 @@ import {
 } from './gmailHoyaPipeline.js';
 import { isGmailRequestedEntityNotFound } from './gmailApiErrors.js';
 
-const BAUSCH_FROM_EMAIL = /sap_generated_no_reply@bausch\.com/i;
+const BAUSCH_FROM_EMAIL = /(?:sap_generated_no_reply|penglee\.phua)@bausch\.com/i;
 /** Gmail 표시명 "Bausch & Lomb (Australia) Pty. Ltd*" 등 */
 const BAUSCH_FROM_DISPLAY =
   /Bausch\s*&\s*Lomb\s*\(\s*Australia\s*\)\s*Pty\.?\s*Ltd\*?/i;

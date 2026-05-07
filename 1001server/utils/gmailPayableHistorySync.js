@@ -57,7 +57,7 @@ async function listRecentPayableVendorFallback(gmail, ids) {
   const res = await gmail.users.messages.list({
     userId: 'me',
     q:
-      '(from:axd365au@hoya.com OR from:admin@artmostgovau.com.au OR from:my.accounts@alcon.com OR from:sap_generated_no_reply@bausch.com) newer_than:14d',
+      '(from:axd365au@hoya.com OR from:admin@artmostgovau.com.au OR from:my.accounts@alcon.com OR from:sap_generated_no_reply@bausch.com OR from:PengLee.Phua@bausch.com) newer_than:14d',
     maxResults: 40
   });
   for (const m of res.data.messages || []) {
